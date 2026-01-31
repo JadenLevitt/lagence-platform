@@ -8,6 +8,8 @@
  */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { loadAllAgents, buildAgentSystemPrompt, getAgent } = require('./agent-loader');
@@ -276,6 +278,23 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       log(`Chat error: ${e.message}`);
       sendJSON(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  // Serve chat widget JS
+  if (req.method === 'GET' && url.pathname === '/chat-widget.js') {
+    const widgetPath = path.join(__dirname, 'chat-widget.js');
+    try {
+      const content = fs.readFileSync(widgetPath, 'utf-8');
+      res.writeHead(200, {
+        'Content-Type': 'application/javascript',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      });
+      res.end(content);
+    } catch (e) {
+      sendJSON(res, 500, { error: 'Failed to load chat widget' });
     }
     return;
   }
