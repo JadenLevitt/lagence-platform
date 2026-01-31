@@ -1,0 +1,54 @@
+{
+  "id": "tech-pack-extraction",
+  "name": "Tech Pack Processing",
+  "description": "Upload CSV files with style numbers to extract tech pack data from Gerber/PLM. Uses Claude AI to analyze tech pack PDFs and extract measurements, materials, closures, and other product attributes.",
+
+  "triggers": [
+    "tech pack",
+    "extract",
+    "gerber",
+    "measurements",
+    "csv upload",
+    "PLM",
+    "product attributes",
+    "extraction"
+  ],
+
+  "actions": [
+    "Upload a CSV file with style numbers",
+    "Download Tech Pack PDFs from Gerber/PLM",
+    "Extract attributes using Claude AI (measurements, materials, closures, etc.)",
+    "Export results to Google Sheets with extraction logic"
+  ],
+
+  "config_files": [
+    "extraction-config.js"
+  ],
+
+  "complexity": "high",
+
+  "example_requests": [
+    "Can you process these tech packs for me?",
+    "I need to extract measurements from the spring collection",
+    "What fields do you extract from tech packs?",
+    "Can you add a new extraction field for belt loops?"
+  ],
+
+  "change_types": {
+    "low": [
+      "Update field examples",
+      "Tweak extraction logic wording",
+      "Add allowed values to existing field"
+    ],
+    "medium": [
+      "Add new extraction field",
+      "Modify field extraction logic significantly",
+      "Change field output format"
+    ],
+    "high": [
+      "Add new data source",
+      "Change PDF processing pipeline",
+      "Modify Google Sheets output structure"
+    ]
+  }
+}

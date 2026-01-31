@@ -1,0 +1,28 @@
+{
+  "name": "lagence-platform",
+  "version": "1.0.0",
+  "description": "L'AGENCE Multi-Agent AI Platform",
+  "main": "core/chat-server.js",
+  "scripts": {
+    "start": "node core/chat-server.js",
+    "dev": "doppler run -- node core/chat-server.js"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "fashion",
+    "automation"
+  ],
+  "author": "L'AGENCE",
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
+    "@supabase/supabase-js": "^2.93.1",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

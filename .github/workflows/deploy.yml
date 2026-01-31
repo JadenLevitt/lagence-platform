@@ -1,0 +1,54 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            echo "Starting deployment..."
+
+            # Navigate to project directory
+            cd ~/lagence-platform || {
+              echo "Directory not found, cloning repo..."
+              cd ~
+              git clone https://github.com/${{ github.repository }}.git lagence-platform
+              cd lagence-platform
+            }
+
+            # Pull latest changes
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Install dependencies
+            npm install --production
+
+            # Restart the server with PM2
+            pm2 describe lagence-platform > /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+              echo "Restarting existing PM2 process..."
+              pm2 restart lagence-platform
+            else
+              echo "Starting new PM2 process..."
+              pm2 start core/chat-server.js --name lagence-platform
+              pm2 save
+            fi
+
+            # Show status
+            pm2 status
+
+            echo "Deployment complete at $(date)"

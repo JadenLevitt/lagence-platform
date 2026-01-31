@@ -1,0 +1,11 @@
+# Shared Capabilities
+
+This folder contains capabilities that are used by multiple agents.
+
+When a capability is useful across departments, place it here instead of
+in a specific agent's capabilities folder.
+
+Examples of shared capabilities:
+- Product lookup
+- Customer research
+- Image analysis

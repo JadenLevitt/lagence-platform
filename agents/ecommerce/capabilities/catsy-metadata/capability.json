@@ -1,0 +1,32 @@
+{
+  "id": "catsy-metadata",
+  "name": "Catsy Metadata Enrichment",
+  "description": "Enriches product metadata in Catsy PIM with AI-generated descriptions, attributes, and categorization.",
+
+  "triggers": [
+    "catsy",
+    "metadata",
+    "product description",
+    "enrichment",
+    "PIM"
+  ],
+
+  "actions": [
+    "Analyze product images and existing data",
+    "Generate product descriptions",
+    "Suggest category and attribute values",
+    "Update Catsy records via API"
+  ],
+
+  "config_files": [],
+
+  "complexity": "high",
+
+  "status": "planned",
+
+  "example_requests": [
+    "Can you help me update product descriptions in Catsy?",
+    "I need to enrich metadata for the new collection",
+    "What fields does the Catsy integration support?"
+  ]
+}
