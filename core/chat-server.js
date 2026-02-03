@@ -14,6 +14,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { loadAllAgents, buildAgentSystemPrompt, getAgent } = require('./agent-loader');
 const { classifyRequest, createCapabilityPR, createPlanProposal } = require('./github-pr-service');
+const { getAllFieldDefinitions } = require('../agents/ecommerce/capabilities/tech-pack-extraction/extraction-config');
 
 const anthropic = new Anthropic();
 const PORT = process.env.PORT || 3000;
@@ -279,6 +280,15 @@ const server = http.createServer(async (req, res) => {
       log(`Chat error: ${e.message}`);
       sendJSON(res, 500, { error: e.message });
     }
+    return;
+  }
+
+  // Get field definitions for tech pack extraction
+  if (req.method === 'GET' && url.pathname === '/field-definitions') {
+    sendJSON(res, 200, {
+      capability: 'tech-pack-extraction',
+      fields: getAllFieldDefinitions()
+    });
     return;
   }
 
