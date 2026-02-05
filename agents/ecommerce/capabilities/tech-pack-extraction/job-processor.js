@@ -622,6 +622,10 @@ async function main() {
 
     const extractedData = prepareExtractedData(extractionResults, styleToRows, originalHeader);
     log("DEBUG", `Extracted data: ${extractedData.rows.length} rows, ${extractedData.headers.length} headers`);
+    log("DEBUG", `Logic tab: ${extractedData.logicRows.length} logic rows, ${extractedData.logicHeaders.length} headers`);
+    if (extractedData.logicRows.length > 0) {
+      log("DEBUG", `Sample logic row: ${JSON.stringify(extractedData.logicRows[0])}`);
+    }
 
     // ========== COMPLETE ==========
     await updateJob({
