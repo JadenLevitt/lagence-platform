@@ -31,12 +31,14 @@ const RETRYABLE_ERRORS = [
   'browser has been closed',
   'context has been closed',
   'page has been closed',
+  'Popup never opened',
   'Navigation timeout',
   'Timeout exceeded',
   'net::ERR_',
   'ECONNRESET',
   'ETIMEDOUT',
-  'socket hang up'
+  'socket hang up',
+  'Unhandled rejection'
 ];
 
 // Track restart attempts to avoid infinite loops
