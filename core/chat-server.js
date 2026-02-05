@@ -282,8 +282,8 @@ const server = http.createServer(async (req, res) => {
 
         // Return friendly response without calling Claude again
         const responseMessage = result.success
-          ? `I've received your request to ${classification.request_type === 'new_capability' ? 'add a new capability' : 'modify the capability'}. Your request has been logged and sent for review. You'll be notified once it's been reviewed.\n\n**Request:** ${classification.change_description}\n**Complexity:** ${classification.complexity}`
-          : `I understood your request but encountered an issue saving it: ${result.error}. Please try again or contact support.`;
+          ? `Got it! I've logged your request and sent it to the team for review. We'll follow up once it's ready.`
+          : `I understood your request but ran into a small issue saving it. Mind trying again?`;
 
         sendJSON(res, 200, {
           agent: { id: agent.id, name: agent.name },
