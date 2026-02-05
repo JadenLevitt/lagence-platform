@@ -22,7 +22,6 @@ jobs:
       - name: Deploy to VM via SSH
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'ENDSSH'
-          script: |
             echo "Starting deployment..."
 
             # Navigate to project directory
