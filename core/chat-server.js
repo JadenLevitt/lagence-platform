@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
-const { loadAllAgents, buildAgentSystemPrompt, getAgent } = require('./agent-loader');
+const { loadAllAgents, buildAgentSystemPrompt } = require('./agent-loader');
 const { classifyRequest } = require('./github-pr-service');
 const { getAllFieldDefinitions } = require('../agents/ecommerce/capabilities/tech-pack-extraction/extraction-config');
 
@@ -39,7 +39,7 @@ async function sendCapabilityChangeNotification({ agentId, classification, userM
       title: classification.change_description,
       description: userMessage,
       complexity: classification.complexity,
-      status: 'pending_review',
+      status: 'pending_approval',
       proposed_changes: {
         request_type: classification.request_type,
         affected_files: classification.affected_files,
