@@ -309,6 +309,9 @@ async function downloadTechPack(page, context, mainFrame, styleNo, workerId) {
     await page3.getByText("Predefined", { exact: true }).click({ force: true });
     await page3.getByRole("button", { name: "save" }).click({ force: true });
 
+    // Close the tech pack creation popup - it's no longer needed
+    await page3.close().catch(() => {});
+
     log("TECHPACK", `[W${workerId}] Waiting for generation...`);
     await mainF.locator('text=/created successfully/i').first().waitFor({ timeout: 180000 });
     await mainF.getByText(/The Tech Pack \(Collection\).*created successfully/i).first().click({ force: true });
@@ -328,6 +331,11 @@ async function downloadTechPack(page, context, mainFrame, styleNo, workerId) {
       fs.writeFileSync(filePath, await resp.body());
       await page4.close().catch(() => {});
     } else { throw new Error("No download"); }
+
+    // Also close page4 if it exists but download was used
+    if (page4 && download) {
+      await page4.close().catch(() => {});
+    }
 
     log("DOWNLOAD", `[W${workerId}] Saved: ${styleNo}`);
     await uploadPdfToSupabase(filePath, styleNo);
