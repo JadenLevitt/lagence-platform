@@ -157,14 +157,17 @@ ${change.affected_files?.map(f => `- \`${f}\``).join('\n') || '- To be determine
     });
 
     // 4. Log to Supabase
-    await supabase.from('feature_requests').insert({
+    const { error: logError } = await supabase.from('feature_requests').insert({
       agent_id: agentId,
       conversation: [],
       assistant_response: `PR created: ${pr.html_url}`,
       classification: change,
       action_taken: { type: 'pr_created', pr_url: pr.html_url, pr_number: pr.number },
       status: 'in_progress'
-    }).catch(err => console.error('Failed to log to Supabase:', err.message));
+    });
+    if (logError) {
+      console.error('Failed to log to Supabase:', logError.message);
+    }
 
     return {
       success: true,
