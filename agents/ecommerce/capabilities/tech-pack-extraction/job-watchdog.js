@@ -22,7 +22,7 @@ const supabase = createClient(
 
 const CHECK_INTERVAL_MS = 60000; // Check every 60 seconds
 const STALE_THRESHOLD_MS = 120000; // Consider dead if no heartbeat for 2 minutes
-const MAX_RESTART_ATTEMPTS = 3;
+const MAX_RESTART_ATTEMPTS = 10; // Allow more retries since jobs make progress each time
 const FAILED_RETRY_WINDOW_MS = 300000; // Only retry failed jobs from last 5 minutes
 
 // Transient errors that should trigger a retry
