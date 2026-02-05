@@ -64,6 +64,38 @@ function getSeasonPriority(season) {
   return 0;
 }
 
+// Parse CSV line preserving empty columns (handles quoted fields)
+function parseCSVLine(line) {
+  const cols = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        // Escaped quote inside quoted field
+        current += '"';
+        i++;
+      } else {
+        // Toggle quote mode
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      // End of field
+      cols.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  // Don't forget the last field
+  cols.push(current.trim());
+
+  return cols;
+}
+
 function readStylesFromCSV(csvPath) {
   const content = fs.readFileSync(csvPath, "utf-8");
   const lines = content.trim().split("\n");
@@ -73,8 +105,8 @@ function readStylesFromCSV(csvPath) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    const cols = line.match(/(\".*?\"|[^\",]+)(?=\s*,|\s*$)/g) || [];
-    const cleanCols = cols.map(c => c.trim().replace(/^\"|\"$/g, ""));
+    const cols = parseCSVLine(line);
+    const cleanCols = cols.map(c => c.replace(/^\"|\"$/g, ""));
     if (i === 0 && (cleanCols[0].toLowerCase().includes("style") || cleanCols[0].toLowerCase().includes("item"))) {
       header = cleanCols; continue;
     }
