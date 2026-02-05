@@ -10,6 +10,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { loadAllAgents, buildAgentSystemPrompt } = require('./agent-loader');
@@ -313,6 +314,46 @@ const server = http.createServer(async (req, res) => {
 
     } catch (e) {
       log(`Chat error: ${e.message}`);
+      sendJSON(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  // Start a job (triggered by frontend when CSV is uploaded)
+  if (req.method === 'POST' && url.pathname === '/start-job') {
+    try {
+      const body = await parseBody(req);
+      const jobId = body.job_id;
+
+      if (!jobId) {
+        sendJSON(res, 400, { error: 'Missing job_id' });
+        return;
+      }
+
+      log(`Starting job: ${jobId}`);
+
+      // Spawn job processor in background
+      const jobProcessor = spawn('node', [
+        path.join(__dirname, '../agents/ecommerce/capabilities/tech-pack-extraction/job-processor.js'),
+        jobId
+      ], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env }
+      });
+
+      jobProcessor.unref();
+
+      log(`Job processor spawned for: ${jobId} (pid: ${jobProcessor.pid})`);
+
+      sendJSON(res, 200, {
+        success: true,
+        job_id: jobId,
+        message: 'Job started'
+      });
+
+    } catch (e) {
+      log(`Start job error: ${e.message}`);
       sendJSON(res, 500, { error: e.message });
     }
     return;
