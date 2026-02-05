@@ -64,7 +64,7 @@ async function sendCapabilityChangeNotification({ agentId, classification, userM
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          from: 'LAGENCE Platform <notifications@demolagence.com>',
+          from: process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev',
           to: NOTIFICATION_EMAIL,
           subject: `[${agentId}] Capability Change Request: ${classification.change_description}`,
           html: `<h2>New Capability Change Request</h2>
