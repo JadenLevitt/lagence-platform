@@ -42,25 +42,24 @@ jobs:
             # Install Playwright browser (needed for job processor)
             npx playwright install chromium --with-deps || echo "Playwright browser install skipped"
 
-            # Restart the server with PM2
+            # Restart the server with PM2 (using Doppler for env vars)
             pm2 describe lagence-platform > /dev/null 2>&1
             if [ $? -eq 0 ]; then
               echo "Restarting existing PM2 process..."
               pm2 restart lagence-platform
             else
               echo "Starting new PM2 process..."
-              pm2 start core/chat-server.js --name lagence-platform
+              doppler run -- pm2 start core/chat-server.js --name lagence-platform
             fi
 
             # Start/restart the job watchdog (monitors for crashed jobs and auto-restarts)
             pm2 describe job-watchdog > /dev/null 2>&1
             if [ $? -eq 0 ]; then
-              echo "Restarting watchdog..."
-              pm2 restart job-watchdog
-            else
-              echo "Starting watchdog..."
-              pm2 start agents/ecommerce/capabilities/tech-pack-extraction/job-watchdog.js --name job-watchdog
+              echo "Deleting old watchdog (may not have env vars)..."
+              pm2 delete job-watchdog
             fi
+            echo "Starting watchdog with Doppler env vars..."
+            doppler run -- pm2 start agents/ecommerce/capabilities/tech-pack-extraction/job-watchdog.js --name job-watchdog
 
             pm2 save
 
