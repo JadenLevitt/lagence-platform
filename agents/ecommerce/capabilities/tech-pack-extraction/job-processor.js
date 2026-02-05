@@ -349,7 +349,8 @@ async function downloadTechPack(page, context, mainFrame, styleNo, workerId) {
   }
 }
 
-async function runDownloadWorker(workerId, browser, styleQueue, downloadResults, updateProgress) {
+// Helper to create a logged-in browser session
+async function createBrowserSession(browser, workerId) {
   const context = await browser.newContext({
     acceptDownloads: true,
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -369,7 +370,7 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
   await page.locator("#txtUserPass").fill(PASS);
   await page.getByRole("button", { name: "Logon" }).click();
   await page.waitForSelector('frame[name="dbody"]', { timeout: 60000 });
-  await page.waitForTimeout(3000); // Wait for frames to fully load
+  await page.waitForTimeout(3000);
 
   const dbodyFrame = page.locator('frame[name="dbody"]').contentFrame();
   const menuFrame = dbodyFrame.locator('frame[name="menu"]').contentFrame();
@@ -381,12 +382,20 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
   await menuFrame.getByRole("link", { name: "Style Search" }).click();
   await page.waitForTimeout(1500);
 
-  log("LOGIN", `[W${workerId}] Ready`);
+  log("LOGIN", `[W${workerId}] Session ready`);
+  return { context, page, menuFrame, mainFrame };
+}
+
+async function runDownloadWorker(workerId, browser, styleQueue, downloadResults, updateProgress) {
+  let session = null;
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 3;
 
   while (true) {
     const styleNo = styleQueue.shift();
     if (!styleNo) break;
 
+    // Check for existing fresh PDF
     const existingPdf = path.join(OUT_DIR, `Tech_Pack_${styleNo}.pdf`);
     if (fs.existsSync(existingPdf) && isPdfFresh(existingPdf)) {
       log("SKIP", `[W${workerId}] Recent PDF exists (< ${PDF_FRESHNESS_DAYS} days): ${styleNo}`);
@@ -397,17 +406,65 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
       log("REFRESH", `[W${workerId}] PDF is stale (> ${PDF_FRESHNESS_DAYS} days), re-downloading: ${styleNo}`);
     }
 
-    const result = await downloadTechPack(page, context, mainFrame, styleNo, workerId);
-    downloadResults.push(result);
-    await updateProgress("download", styleNo, result.success);
-
-    if (!result.success) {
-      try { await menuFrame.getByText("Style", { exact: true }).click(); await menuFrame.getByRole("link", { name: "Style Search" }).click(); await page.waitForTimeout(1000); } catch {}
+    // Create session if needed (first time or after crash)
+    if (!session) {
+      try {
+        session = await createBrowserSession(browser, workerId);
+      } catch (err) {
+        log("ERROR", `[W${workerId}] Failed to create session: ${err.message}`);
+        downloadResults.push({ styleNo, success: false, error: `Session creation failed: ${err.message}` });
+        await updateProgress("download", styleNo, false);
+        continue;
+      }
     }
-    await page.waitForTimeout(1000);
+
+    try {
+      const result = await downloadTechPack(session.page, session.context, session.mainFrame, styleNo, workerId);
+      downloadResults.push(result);
+      await updateProgress("download", styleNo, result.success);
+
+      if (result.success) {
+        consecutiveFailures = 0;
+      } else {
+        consecutiveFailures++;
+        // Try to reset to Style Search for next attempt
+        try {
+          await session.menuFrame.getByText("Style", { exact: true }).click();
+          await session.menuFrame.getByRole("link", { name: "Style Search" }).click();
+          await session.page.waitForTimeout(1000);
+        } catch {}
+      }
+
+      await session.page.waitForTimeout(1000);
+
+    } catch (err) {
+      // Likely browser/context crashed
+      log("ERROR", `[W${workerId}] Browser error for ${styleNo}: ${err.message}`);
+      downloadResults.push({ styleNo, success: false, error: err.message });
+      await updateProgress("download", styleNo, false);
+      consecutiveFailures++;
+
+      // Close crashed session and force recreation
+      try {
+        await session.context.close().catch(() => {});
+      } catch {}
+      session = null;
+
+      // If too many consecutive failures, put style back and wait before retry
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        log("WARN", `[W${workerId}] ${consecutiveFailures} consecutive failures, waiting 30s before retry...`);
+        styleQueue.unshift(styleNo); // Put the style back at front of queue
+        downloadResults.pop(); // Remove the failed result we just added
+        await new Promise(r => setTimeout(r, 30000));
+        consecutiveFailures = 0;
+      }
+    }
   }
 
-  await context.close();
+  // Cleanup
+  if (session) {
+    await session.context.close().catch(() => {});
+  }
   log("DONE", `[W${workerId}] Download worker finished`);
 }
 
