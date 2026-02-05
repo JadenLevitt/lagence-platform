@@ -101,23 +101,52 @@ function readStylesFromCSV(csvPath) {
   const lines = content.trim().split("\n");
   const uniqueStyles = [], seen = new Set(), styleMap = {};
   let header = null;
+  let headerMap = {}; // Maps column name -> index
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const cols = parseCSVLine(line);
     const cleanCols = cols.map(c => c.replace(/^\"|\"$/g, ""));
+
+    // First row with "style" or "item" in first column is the header
     if (i === 0 && (cleanCols[0].toLowerCase().includes("style") || cleanCols[0].toLowerCase().includes("item"))) {
-      header = cleanCols; continue;
+      header = cleanCols;
+      // Build header name -> index mapping for flexible column lookup
+      cleanCols.forEach((colName, idx) => {
+        if (colName) headerMap[colName.toUpperCase().trim()] = idx;
+      });
+      continue;
     }
-    const itemId = cleanCols[0] || "";
+
+    // Find ITEM ID - could be first column or named column
+    let itemId = cleanCols[0] || "";
+    if (headerMap["ITEM ID"] !== undefined) {
+      itemId = cleanCols[headerMap["ITEM ID"]] || cleanCols[0] || "";
+    }
+
     const styleNo = itemId.split("-")[0];
     if (!styleNo) continue;
+
+    // Store row data as a map of field name -> value for flexible access
+    const rowData = {};
+    if (header) {
+      header.forEach((colName, idx) => {
+        if (colName) rowData[colName.toUpperCase().trim()] = cleanCols[idx] || "";
+      });
+    }
+
     if (!styleMap[styleNo]) styleMap[styleNo] = [];
-    styleMap[styleNo].push({ itemId, styleNo, originalRow: cleanCols, lineIndex: i });
+    styleMap[styleNo].push({
+      itemId,
+      styleNo,
+      originalRow: cleanCols,    // Keep positional array for backwards compat
+      rowData,                    // Add named map for flexible field access
+      lineIndex: i
+    });
     if (!seen.has(styleNo)) { seen.add(styleNo); uniqueStyles.push(styleNo); }
   }
-  return { uniqueStyles, styleToRows: styleMap, header };
+  return { uniqueStyles, styleToRows: styleMap, header, headerMap };
 }
 
 async function uploadPdfToSupabase(filePath, styleNo) {
@@ -394,7 +423,9 @@ async function extractAttributesFromPdf(pdfPath, styleNo, retryCount = 0) {
 
 // ========== PREPARE EXTRACTED DATA FOR EXPORT ==========
 // Takes extraction results and maps them back to ALL original rows
-// IMPORTANT: Fills in existing columns from input CSV, does NOT add duplicate columns
+// KEY BEHAVIORS:
+// 1. Always outputs ALL canonical fields from FIELD_DEFINITIONS (flexible input)
+// 2. Preserves any uploaded data - only fills in EMPTY cells
 // Returns both main data and logic/confidence data for a second tab
 function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
   // Build a map of styleNo prefix -> extracted data (full object with logic)
@@ -428,17 +459,16 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
     return false;
   };
 
-  // Get tech pack field names that we extract
-  const techPackFields = getTechPackFields();
-  const techPackFieldNames = techPackFields.map(f => f.field_name);
+  // Get ALL canonical field names from FIELD_DEFINITIONS
+  const allFields = getAllFieldDefinitions();
+  const allFieldNames = allFields.map(f => f.field_name);
+  const techPackFieldNames = getTechPackFields().map(f => f.field_name);
 
-  // Use original header order - only add PDF_LINK if not present
-  let headers = originalHeader ? [...originalHeader] : ["ITEM ID"];
-  if (!headers.includes("PDF_LINK")) {
-    headers.push("PDF_LINK");
-  }
+  // ALWAYS output all canonical fields + PDF_LINK (flexible input support)
+  const headers = [...allFieldNames, "PDF_LINK"];
 
   log("DEBUG", `Original CSV headers: ${originalHeader ? originalHeader.join(', ') : 'none'}`);
+  log("DEBUG", `Canonical output headers (${headers.length}): ${headers.join(', ')}`);
   log("DEBUG", `Tech pack fields to fill: ${techPackFieldNames.join(', ')}`);
 
   const rows = [];
@@ -468,24 +498,23 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
     for (const origRow of originalRows) {
       const row = {};
 
-      // Start with all original CSV values in their original positions
-      if (originalHeader) {
-        for (let i = 0; i < originalHeader.length; i++) {
-          const colName = originalHeader[i];
-          const originalValue = origRow.originalRow[i] || "";
+      // Build row using ALL canonical fields
+      for (const fieldName of allFieldNames) {
+        // Look up input value by field name (case-insensitive via rowData map)
+        const inputValue = (origRow.rowData && origRow.rowData[fieldName.toUpperCase().trim()]) || "";
 
-          // Check if this column should be filled with extracted data
-          if (techPackFieldNames.includes(colName)) {
-            // This is a tech pack field - use extracted value if available
-            const extractedValue = getValue(extractedData[colName]);
-            row[colName] = extractedValue || originalValue;
+        if (techPackFieldNames.includes(fieldName)) {
+          // This is a tech_pack field that we extract
+          // PRESERVE uploaded data: only use extracted value if input was EMPTY
+          if (inputValue && inputValue.trim()) {
+            row[fieldName] = inputValue; // Keep user-provided data
           } else {
-            // Keep original value (input_csv or separate_csv field)
-            row[colName] = originalValue;
+            row[fieldName] = getValue(extractedData[fieldName]); // Fill in missing
           }
+        } else {
+          // input_csv or separate_csv field - always use input value (might be empty)
+          row[fieldName] = inputValue;
         }
-      } else {
-        row["ITEM ID"] = origRow.itemId;
       }
 
       // Add PDF link
@@ -497,7 +526,6 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
 
   log("DEBUG", `Prepared ${rows.length} output rows from ${Object.keys(styleToRows).length} unique styles`);
   log("DEBUG", `Prepared ${logicRows.length} logic rows`);
-  log("DEBUG", `Output headers (${headers.length}): ${headers.join(', ')}`);
 
   // Logic tab structure
   const logicHeaders = ["STYLE PREFIX", "FIELD", "VALUE", "LOGIC", "NEEDS REVIEW"];
