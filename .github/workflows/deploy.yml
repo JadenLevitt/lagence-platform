@@ -50,8 +50,19 @@ jobs:
             else
               echo "Starting new PM2 process..."
               pm2 start core/chat-server.js --name lagence-platform
-              pm2 save
             fi
+
+            # Start/restart the job watchdog (monitors for crashed jobs and auto-restarts)
+            pm2 describe job-watchdog > /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+              echo "Restarting watchdog..."
+              pm2 restart job-watchdog
+            else
+              echo "Starting watchdog..."
+              pm2 start agents/ecommerce/capabilities/tech-pack-extraction/job-watchdog.js --name job-watchdog
+            fi
+
+            pm2 save
 
             # Show status
             pm2 status
