@@ -38,6 +38,59 @@ const supabase = createClient(
 
 const anthropic = new Anthropic();
 
+// ========== CRASH PROTECTION ==========
+// Global error handlers to catch crashes and mark job as failed
+let heartbeatInterval = null;
+
+process.on('uncaughtException', async (err) => {
+  console.error(`[CRASH] Uncaught exception: ${err.message}`);
+  console.error(err.stack);
+  try {
+    await supabase.from("jobs").update({
+      status: "failed",
+      error_message: `Crash: ${err.message}`
+    }).eq("id", JOB_ID);
+  } catch (e) {
+    console.error(`Failed to update job status on crash: ${e.message}`);
+  }
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error(`[CRASH] Unhandled rejection: ${reason}`);
+  try {
+    await supabase.from("jobs").update({
+      status: "failed",
+      error_message: `Unhandled rejection: ${reason}`
+    }).eq("id", JOB_ID);
+  } catch (e) {
+    console.error(`Failed to update job status on rejection: ${e.message}`);
+  }
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  process.exit(1);
+});
+
+// Heartbeat - update every 30 seconds so we can detect dead jobs
+function startHeartbeat() {
+  heartbeatInterval = setInterval(async () => {
+    try {
+      await supabase.from("jobs").update({
+        updated_at: new Date().toISOString()
+      }).eq("id", JOB_ID);
+    } catch (e) {
+      console.error(`Heartbeat failed: ${e.message}`);
+    }
+  }, 30000);
+}
+
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
+
 // ========== LOGGING ==========
 function log(level, msg) {
   const timestamp = new Date().toISOString().substr(11, 8);
@@ -542,22 +595,60 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
 async function main() {
   log("START", `Processing job: ${JOB_ID}`);
 
+  // Start heartbeat for crash detection
+  startHeartbeat();
+
   const { data: job, error } = await supabase.from("jobs").select("*").eq("id", JOB_ID).single();
   if (error || !job) {
     log("ERROR", `Job not found: ${JOB_ID}`);
+    stopHeartbeat();
     process.exit(1);
+  }
+
+  // Track completed styles for resume capability
+  let completedDownloads = new Set(job.completed_downloads || []);
+  let completedExtractions = new Set(job.completed_extractions || []);
+  let partialExtractions = job.partial_extractions || {}; // Map of styleNo -> extracted data
+
+  // Check if this is a resume
+  if (completedDownloads.size > 0 || completedExtractions.size > 0) {
+    log("RESUME", `Resuming job - ${completedDownloads.size} downloads, ${completedExtractions.size} extractions already done`);
   }
 
   let totalProcessed = 0;
   let totalStyles = 0;
 
-  const updateProgress = async (phase, styleNo, success) => {
+  // Save progress after each style completes
+  const saveCompletedStyle = async (phase, styleNo, extractionData = null) => {
+    if (phase === "download") {
+      completedDownloads.add(styleNo);
+      await supabase.from("jobs").update({
+        completed_downloads: Array.from(completedDownloads)
+      }).eq("id", JOB_ID);
+    } else if (phase === "extract") {
+      completedExtractions.add(styleNo);
+      if (extractionData) {
+        partialExtractions[styleNo] = extractionData;
+      }
+      await supabase.from("jobs").update({
+        completed_extractions: Array.from(completedExtractions),
+        partial_extractions: partialExtractions
+      }).eq("id", JOB_ID);
+    }
+  };
+
+  const updateProgress = async (phase, styleNo, success, extractionData = null) => {
     totalProcessed++;
     const percent = Math.round((totalProcessed / (totalStyles * 2)) * 100); // *2 for download + extract phases
     await updateJob({
       current_style: `${phase}: ${styleNo}`,
       progress_percent: Math.min(percent, 99)
     });
+
+    // Save completed style for resume capability
+    if (success) {
+      await saveCompletedStyle(phase, styleNo, extractionData);
+    }
   };
 
   try {
@@ -577,8 +668,27 @@ async function main() {
     // ========== PHASE 1: DOWNLOAD PDFS ==========
     log("PHASE", "Starting PDF downloads...");
 
-    const styleQueue = [...uniqueStyles];
+    // Filter out already-completed downloads for resume capability
+    const stylesToDownload = uniqueStyles.filter(s => !completedDownloads.has(s));
+    const styleQueue = [...stylesToDownload];
     const downloadResults = [];
+
+    // Pre-populate results for already-completed downloads
+    for (const styleNo of completedDownloads) {
+      const existingPdf = path.join(OUT_DIR, `Tech_Pack_${safe(styleNo)}.pdf`);
+      if (fs.existsSync(existingPdf)) {
+        downloadResults.push({ styleNo, success: true, skipped: true, filePath: existingPdf });
+        totalProcessed++; // Count toward progress
+      } else {
+        // PDF file is missing, need to re-download
+        styleQueue.push(styleNo);
+        completedDownloads.delete(styleNo); // Remove from completed
+      }
+    }
+
+    if (stylesToDownload.length < uniqueStyles.length) {
+      log("RESUME", `Skipping ${uniqueStyles.length - stylesToDownload.length} already-downloaded styles`);
+    }
 
     const browser = await chromium.launch({
       headless: HEADLESS,
@@ -603,24 +713,53 @@ async function main() {
     log("PHASE", "Starting attribute extraction...");
 
     const extractionResults = [];
-    for (const download of successfulDownloads) {
+
+    // Filter out already-completed extractions for resume capability
+    const stylesToExtract = successfulDownloads.filter(d => !completedExtractions.has(d.styleNo));
+
+    if (stylesToExtract.length < successfulDownloads.length) {
+      log("RESUME", `Skipping ${successfulDownloads.length - stylesToExtract.length} already-extracted styles`);
+      // Add placeholder results for already-extracted styles (data will be loaded from saved state)
+      for (const download of successfulDownloads) {
+        if (completedExtractions.has(download.styleNo)) {
+          totalProcessed++; // Count toward progress
+        }
+      }
+    }
+
+    for (const download of stylesToExtract) {
       if (!download.filePath) continue;
 
       const result = await extractAttributesFromPdf(download.filePath, download.styleNo);
       extractionResults.push(result);
-      await updateProgress("extract", download.styleNo, result.success);
+      // Pass extraction data for saving (for resume capability)
+      await updateProgress("extract", download.styleNo, result.success, result.success ? result.data : null);
 
       // Rate limit: wait 5 seconds between API calls to avoid 429 errors
       await new Promise(r => setTimeout(r, 5000));
     }
 
     const successfulExtractions = extractionResults.filter(r => r.success);
-    log("PHASE", `Extractions complete: ${successfulExtractions.length}/${successfulDownloads.length}`);
+    log("PHASE", `Extractions complete: ${successfulExtractions.length}/${stylesToExtract.length}`);
 
     // ========== PHASE 3: SAVE EXTRACTED DATA ==========
     log("PHASE", "Saving extracted data to Supabase...");
 
-    const extractedData = prepareExtractedData(extractionResults, styleToRows, originalHeader);
+    // Combine new extraction results with previously-saved partial extractions
+    const allExtractionResults = [...extractionResults];
+    for (const styleNo of Object.keys(partialExtractions)) {
+      // Only add if not already in extractionResults
+      if (!extractionResults.find(r => r.styleNo === styleNo)) {
+        allExtractionResults.push({
+          styleNo,
+          success: true,
+          data: partialExtractions[styleNo]
+        });
+      }
+    }
+    log("DEBUG", `Total extraction results: ${allExtractionResults.length} (${extractionResults.length} new + ${Object.keys(partialExtractions).length} resumed)`);
+
+    const extractedData = prepareExtractedData(allExtractionResults, styleToRows, originalHeader);
     log("DEBUG", `Extracted data: ${extractedData.rows.length} rows, ${extractedData.headers.length} headers`);
     log("DEBUG", `Logic tab: ${extractedData.logicRows.length} logic rows, ${extractedData.logicHeaders.length} headers`);
     if (extractedData.logicRows.length > 0) {
@@ -637,10 +776,12 @@ async function main() {
     });
 
     log("COMPLETE", `Job finished. Data ready for export to Google Sheets.`);
+    stopHeartbeat();
 
   } catch (error) {
     log("ERROR", `Job failed: ${error.message}`);
     await updateJob({ status: "failed", error_message: error.message });
+    stopHeartbeat();
     process.exit(1);
   }
 }
