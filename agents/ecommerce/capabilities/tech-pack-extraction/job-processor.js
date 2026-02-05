@@ -108,6 +108,21 @@ async function updateJob(updates) {
 // ========== PDF DOWNLOAD FUNCTIONS ==========
 function safe(s) { return s.replace(/[^a-zA-Z0-9._-]/g, "_"); }
 
+// Check if a PDF is fresh (created within last N days)
+// Tech packs get updated, so we only reuse recent downloads
+const PDF_FRESHNESS_DAYS = 15;
+
+function isPdfFresh(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    const ageMs = Date.now() - stats.mtime.getTime();
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    return ageDays <= PDF_FRESHNESS_DAYS;
+  } catch {
+    return false;
+  }
+}
+
 function getSeasonPriority(season) {
   const s = (season || "").toUpperCase();
   if (s.includes("FALL") || s.includes("FW") || s.includes("HOLIDAY")) return 4;
@@ -365,11 +380,13 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
     if (!styleNo) break;
 
     const existingPdf = path.join(OUT_DIR, `Tech_Pack_${styleNo}.pdf`);
-    if (fs.existsSync(existingPdf)) {
-      log("SKIP", `[W${workerId}] Already exists: ${styleNo}`);
+    if (fs.existsSync(existingPdf) && isPdfFresh(existingPdf)) {
+      log("SKIP", `[W${workerId}] Recent PDF exists (< ${PDF_FRESHNESS_DAYS} days): ${styleNo}`);
       downloadResults.push({ styleNo, success: true, skipped: true, filePath: existingPdf });
       await updateProgress("download", styleNo, true);
       continue;
+    } else if (fs.existsSync(existingPdf)) {
+      log("REFRESH", `[W${workerId}] PDF is stale (> ${PDF_FRESHNESS_DAYS} days), re-downloading: ${styleNo}`);
     }
 
     const result = await downloadTechPack(page, context, mainFrame, styleNo, workerId);
@@ -676,11 +693,14 @@ async function main() {
     // Pre-populate results for already-completed downloads
     for (const styleNo of completedDownloads) {
       const existingPdf = path.join(OUT_DIR, `Tech_Pack_${safe(styleNo)}.pdf`);
-      if (fs.existsSync(existingPdf)) {
+      if (fs.existsSync(existingPdf) && isPdfFresh(existingPdf)) {
         downloadResults.push({ styleNo, success: true, skipped: true, filePath: existingPdf });
         totalProcessed++; // Count toward progress
       } else {
-        // PDF file is missing, need to re-download
+        // PDF file is missing or stale, need to re-download
+        if (fs.existsSync(existingPdf)) {
+          log("REFRESH", `PDF is stale (> ${PDF_FRESHNESS_DAYS} days), will re-download: ${styleNo}`);
+        }
         styleQueue.push(styleNo);
         completedDownloads.delete(styleNo); // Remove from completed
       }
