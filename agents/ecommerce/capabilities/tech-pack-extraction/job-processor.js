@@ -274,25 +274,47 @@ async function downloadTechPack(page, context, mainFrame, styleNo, workerId) {
   log("STYLE", `[W${workerId}] Processing: ${styleNo}`);
 
   try {
-    await mainFrame.locator("#txtStyleNo").fill("");
-    await mainFrame.locator("#txtStyleNo").fill(styleNo);
-    await mainFrame.getByRole("link", { name: "Search", exact: true }).click();
-    await page.waitForTimeout(1500);
+    // Retry the search-and-popup flow up to 3 times (popup can be flaky)
+    const MAX_POPUP_RETRIES = 3;
+    let page2 = null;
 
-    const page2Promise = page.waitForEvent("popup", { timeout: 20000 }).catch(() => { throw new Error("Popup never opened"); });
-    const selectResult = await selectMostRecentResult(mainFrame, styleNo);
+    for (let attempt = 1; attempt <= MAX_POPUP_RETRIES; attempt++) {
+      try {
+        await mainFrame.locator("#txtStyleNo").fill("");
+        await mainFrame.locator("#txtStyleNo").fill(styleNo);
+        await mainFrame.getByRole("link", { name: "Search", exact: true }).click();
+        await page.waitForTimeout(2000);
 
-    if (!selectResult.success) {
-      try { await mainFrame.getByText(styleNo, { exact: true }).first().click(); }
-      catch {
-        const seasons = ["FALL", "SPRING", "SUMMER", "WINTER", "HOLIDAY", "RESORT"];
-        let clicked = false;
-        for (const season of seasons) { try { await mainFrame.getByText(season, { exact: true }).first().click({ timeout: 2000 }); clicked = true; break; } catch {} }
-        if (!clicked) throw new Error("No clickable search result");
+        const page2Promise = page.waitForEvent("popup", { timeout: 30000 }).catch(() => { throw new Error("Popup never opened"); });
+        const selectResult = await selectMostRecentResult(mainFrame, styleNo);
+
+        if (!selectResult.success) {
+          try { await mainFrame.getByText(styleNo, { exact: true }).first().click(); }
+          catch {
+            const seasons = ["FALL", "SPRING", "SUMMER", "WINTER", "HOLIDAY", "RESORT"];
+            let clicked = false;
+            for (const season of seasons) { try { await mainFrame.getByText(season, { exact: true }).first().click({ timeout: 2000 }); clicked = true; break; } catch {} }
+            if (!clicked) throw new Error("No clickable search result");
+          }
+        } else { log("SEARCH", `[W${workerId}] Selected: ${selectResult.season}`); }
+
+        page2 = await page2Promise;
+        break; // Success - exit retry loop
+      } catch (retryErr) {
+        // Close any stray popups before retrying
+        const pages = context.pages();
+        for (const p of pages) { if (p !== page) await p.close().catch(() => {}); }
+
+        if (attempt < MAX_POPUP_RETRIES) {
+          log("RETRY", `[W${workerId}] Popup attempt ${attempt}/${MAX_POPUP_RETRIES} failed for ${styleNo}: ${retryErr.message}. Retrying...`);
+          await page.waitForTimeout(3000);
+        } else {
+          throw retryErr; // All retries exhausted
+        }
       }
-    } else { log("SEARCH", `[W${workerId}] Selected: ${selectResult.season}`); }
+    }
 
-    const page2 = await page2Promise;
+    if (!page2) throw new Error("Popup never opened after retries");
     await page2.waitForLoadState("domcontentloaded");
     await page2.waitForSelector('frame[name="menu"]', { timeout: 30000 });
     const menuFrame2 = page2.locator('frame[name="menu"]').contentFrame();
@@ -427,6 +449,16 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
+
+        // For transient errors, put the style back at the end of the queue for retry
+        const transientErrors = ['Popup never opened', 'Timeout', 'timeout', 'net::', 'Navigation failed', 'Target closed'];
+        const isTransient = result.error && transientErrors.some(e => result.error.includes(e));
+        if (isTransient && styleQueue.length > 0) {
+          log("RETRY", `[W${workerId}] Re-queuing ${styleNo} (transient error: ${result.error})`);
+          styleQueue.push(styleNo); // Put at end of queue
+          downloadResults.pop(); // Remove the failed result
+        }
+
         // Try to reset to Style Search for next attempt
         try {
           await session.menuFrame.getByText("Style", { exact: true }).click();
