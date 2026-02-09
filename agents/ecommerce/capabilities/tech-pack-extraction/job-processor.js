@@ -434,11 +434,16 @@ async function createBrowserSession(browser, workerId) {
 async function runDownloadWorker(workerId, browser, styleQueue, downloadResults, updateProgress) {
   let session = null;
   let consecutiveFailures = 0;
-  const MAX_CONSECUTIVE_FAILURES = 3;
+  const MAX_CONSECUTIVE_FAILURES = 5;
+  const MAX_STYLE_ATTEMPTS = 4; // Max times we'll try a single style
+  const styleAttempts = {}; // Track per-style retry count
 
   while (true) {
     const styleNo = styleQueue.shift();
     if (!styleNo) break;
+
+    // Track attempts per style
+    styleAttempts[styleNo] = (styleAttempts[styleNo] || 0) + 1;
 
     // Check for existing fresh PDF
     const existingPdf = path.join(OUT_DIR, `Tech_Pack_${styleNo}.pdf`);
@@ -455,10 +460,18 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
     if (!session) {
       try {
         session = await createBrowserSession(browser, workerId);
+        consecutiveFailures = 0; // Reset on successful session creation
       } catch (err) {
         log("ERROR", `[W${workerId}] Failed to create session: ${err.message}`);
-        downloadResults.push({ styleNo, success: false, error: `Session creation failed: ${err.message}` });
-        await updateProgress("download", styleNo, false);
+        // Re-queue the style if we haven't exhausted attempts
+        if (styleAttempts[styleNo] < MAX_STYLE_ATTEMPTS) {
+          styleQueue.push(styleNo);
+        } else {
+          log("SKIP", `[W${workerId}] Giving up on ${styleNo} after ${styleAttempts[styleNo]} attempts, moving on`);
+          downloadResults.push({ styleNo, success: false, error: `Session creation failed: ${err.message}` });
+          await updateProgress("download", styleNo, false);
+        }
+        await new Promise(r => setTimeout(r, 5000));
         continue;
       }
     }
@@ -473,45 +486,60 @@ async function runDownloadWorker(workerId, browser, styleQueue, downloadResults,
       } else {
         consecutiveFailures++;
 
-        // For transient errors, put the style back at the end of the queue for retry
-        const transientErrors = ['Popup never opened', 'Timeout', 'timeout', 'net::', 'Navigation failed', 'Target closed'];
-        const isTransient = result.error && transientErrors.some(e => result.error.includes(e));
-        if (isTransient && styleQueue.length > 0) {
-          log("RETRY", `[W${workerId}] Re-queuing ${styleNo} (transient error: ${result.error})`);
+        // Re-queue the style if we haven't exhausted per-style attempts
+        if (styleAttempts[styleNo] < MAX_STYLE_ATTEMPTS) {
+          log("RETRY", `[W${workerId}] Re-queuing ${styleNo} attempt ${styleAttempts[styleNo]}/${MAX_STYLE_ATTEMPTS} (error: ${result.error})`);
           styleQueue.push(styleNo); // Put at end of queue
           downloadResults.pop(); // Remove the failed result
+        } else {
+          log("SKIP", `[W${workerId}] Giving up on ${styleNo} after ${styleAttempts[styleNo]} attempts, moving on`);
         }
 
         // Try to reset to Style Search for next attempt
+        let navResetOk = false;
         try {
           await session.menuFrame.getByText("Style", { exact: true }).click();
           await session.menuFrame.getByRole("link", { name: "Style Search" }).click();
           await session.page.waitForTimeout(1000);
+          navResetOk = true;
         } catch {}
+
+        // If nav reset failed, session is probably broken - recreate it
+        if (!navResetOk) {
+          log("WARN", `[W${workerId}] Nav reset failed, recreating session`);
+          try { await session.context.close().catch(() => {}); } catch {}
+          session = null;
+        }
       }
 
-      await session.page.waitForTimeout(1000);
+      await new Promise(r => setTimeout(r, 1000));
 
     } catch (err) {
       // Likely browser/context crashed
       log("ERROR", `[W${workerId}] Browser error for ${styleNo}: ${err.message}`);
-      downloadResults.push({ styleNo, success: false, error: err.message });
-      await updateProgress("download", styleNo, false);
       consecutiveFailures++;
 
       // Close crashed session and force recreation
-      try {
-        await session.context.close().catch(() => {});
-      } catch {}
+      try { await session.context.close().catch(() => {}); } catch {}
       session = null;
 
-      // If too many consecutive failures, put style back and wait before retry
+      // Re-queue the style if we haven't exhausted per-style attempts
+      if (styleAttempts[styleNo] < MAX_STYLE_ATTEMPTS) {
+        log("RETRY", `[W${workerId}] Re-queuing ${styleNo} after crash, attempt ${styleAttempts[styleNo]}/${MAX_STYLE_ATTEMPTS}`);
+        styleQueue.push(styleNo);
+      } else {
+        log("SKIP", `[W${workerId}] Giving up on ${styleNo} after ${styleAttempts[styleNo]} attempts, moving on`);
+        downloadResults.push({ styleNo, success: false, error: err.message });
+        await updateProgress("download", styleNo, false);
+      }
+
+      // If many consecutive failures, wait before retrying
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        log("WARN", `[W${workerId}] ${consecutiveFailures} consecutive failures, waiting 30s before retry...`);
-        styleQueue.unshift(styleNo); // Put the style back at front of queue
-        downloadResults.pop(); // Remove the failed result we just added
-        await new Promise(r => setTimeout(r, 30000));
+        log("WARN", `[W${workerId}] ${consecutiveFailures} consecutive failures, waiting 60s before retry...`);
+        await new Promise(r => setTimeout(r, 60000));
         consecutiveFailures = 0;
+      } else {
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
   }
@@ -847,7 +875,11 @@ async function main() {
     await browser.close();
 
     const successfulDownloads = downloadResults.filter(r => r.success);
-    log("PHASE", `Downloads complete: ${successfulDownloads.length}/${totalStyles}`);
+    const failedDownloads = downloadResults.filter(r => !r.success);
+    log("PHASE", `Downloads complete: ${successfulDownloads.length}/${totalStyles} succeeded, ${failedDownloads.length} failed`);
+    if (failedDownloads.length > 0) {
+      log("INFO", `Failed downloads: ${failedDownloads.map(r => r.styleNo).join(', ')}`);
+    }
 
     // ========== PHASE 2: EXTRACT ATTRIBUTES ==========
     log("PHASE", "Starting attribute extraction...");
@@ -870,17 +902,28 @@ async function main() {
     for (const download of stylesToExtract) {
       if (!download.filePath) continue;
 
-      const result = await extractAttributesFromPdf(download.filePath, download.styleNo);
-      extractionResults.push(result);
-      // Pass extraction data for saving (for resume capability)
-      await updateProgress("extract", download.styleNo, result.success, result.success ? result.data : null);
+      try {
+        const result = await extractAttributesFromPdf(download.filePath, download.styleNo);
+        extractionResults.push(result);
+        // Pass extraction data for saving (for resume capability)
+        await updateProgress("extract", download.styleNo, result.success, result.success ? result.data : null);
+      } catch (extractErr) {
+        // Never let a single extraction kill the whole job
+        log("ERROR", `Extraction crashed for ${download.styleNo}: ${extractErr.message}`);
+        extractionResults.push({ styleNo: download.styleNo, success: false, error: extractErr.message });
+        await updateProgress("extract", download.styleNo, false);
+      }
 
       // Rate limit: wait 5 seconds between API calls to avoid 429 errors
       await new Promise(r => setTimeout(r, 5000));
     }
 
     const successfulExtractions = extractionResults.filter(r => r.success);
-    log("PHASE", `Extractions complete: ${successfulExtractions.length}/${stylesToExtract.length}`);
+    const failedExtractions = extractionResults.filter(r => !r.success);
+    log("PHASE", `Extractions complete: ${successfulExtractions.length}/${stylesToExtract.length} succeeded, ${failedExtractions.length} failed`);
+    if (failedExtractions.length > 0) {
+      log("INFO", `Failed extractions: ${failedExtractions.map(r => r.styleNo).join(', ')}`);
+    }
 
     // ========== PHASE 3: SAVE EXTRACTED DATA ==========
     log("PHASE", "Saving extracted data to Supabase...");
@@ -907,19 +950,29 @@ async function main() {
     }
 
     // ========== COMPLETE ==========
+    const failedCount = totalStyles - successfulExtractions.length;
+    const failedStylesList = [
+      ...failedDownloads.map(r => r.styleNo),
+      ...failedExtractions.map(r => r.styleNo)
+    ].filter(Boolean);
+
     await updateJob({
       status: "ready_for_export",
       progress_percent: 100,
       successful_count: successfulExtractions.length,
-      failed_count: totalStyles - successfulExtractions.length,
-      extracted_data: extractedData
+      failed_count: failedCount,
+      extracted_data: extractedData,
+      error_message: failedCount > 0
+        ? `Completed with ${failedCount} failed style(s): ${failedStylesList.join(', ')}`
+        : null
     });
 
-    log("COMPLETE", `Job finished. Data ready for export to Google Sheets.`);
+    log("COMPLETE", `Job finished: ${successfulExtractions.length}/${totalStyles} styles extracted. ${failedCount > 0 ? `Failed: ${failedStylesList.join(', ')}` : 'All successful!'}`);
     stopHeartbeat();
 
   } catch (error) {
-    log("ERROR", `Job failed: ${error.message}`);
+    // This should only fire for truly fatal errors (can't read input file, etc.)
+    log("ERROR", `Job failed with fatal error: ${error.message}`);
     await updateJob({ status: "failed", error_message: error.message });
     stopHeartbeat();
     process.exit(1);
