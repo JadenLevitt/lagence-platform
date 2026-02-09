@@ -21,7 +21,8 @@ jobs:
 
       - name: Deploy to VM via SSH
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'ENDSSH'
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'ENDSSH'
+            set -e
             echo "Starting deployment..."
 
             # Navigate to project directory
@@ -36,11 +37,16 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            # Install dependencies
-            npm install --production
+            # Install dependencies (skip optional deps to speed up)
+            npm install --production --no-optional 2>&1 | tail -5
 
-            # Install Playwright browser (needed for job processor)
-            npx playwright install chromium --with-deps || echo "Playwright browser install skipped"
+            # Only install Playwright if not already present
+            if [ ! -d "$HOME/.cache/ms-playwright/chromium-"* ]; then
+              echo "Installing Playwright chromium..."
+              npx playwright install chromium --with-deps || echo "Playwright browser install skipped"
+            else
+              echo "Playwright chromium already installed, skipping"
+            fi
 
             # Restart the server with PM2 (using Doppler for env vars)
             pm2 describe lagence-platform > /dev/null 2>&1
@@ -55,11 +61,12 @@ jobs:
             # Start/restart the job watchdog (monitors for crashed jobs and auto-restarts)
             pm2 describe job-watchdog > /dev/null 2>&1
             if [ $? -eq 0 ]; then
-              echo "Deleting old watchdog (may not have env vars)..."
-              pm2 delete job-watchdog
+              echo "Restarting watchdog..."
+              pm2 restart job-watchdog
+            else
+              echo "Starting watchdog with Doppler env vars..."
+              doppler run -- pm2 start agents/ecommerce/capabilities/tech-pack-extraction/job-watchdog.js --name job-watchdog
             fi
-            echo "Starting watchdog with Doppler env vars..."
-            doppler run -- pm2 start agents/ecommerce/capabilities/tech-pack-extraction/job-watchdog.js --name job-watchdog
 
             pm2 save
 
