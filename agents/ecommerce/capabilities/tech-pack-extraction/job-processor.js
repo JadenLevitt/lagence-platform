@@ -58,11 +58,26 @@ process.on('uncaughtException', async (err) => {
 });
 
 process.on('unhandledRejection', async (reason, promise) => {
-  console.error(`[CRASH] Unhandled rejection: ${reason}`);
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error(`[WARN] Unhandled rejection: ${msg}`);
+
+  // Don't kill the process for transient Playwright errors - just log and continue
+  const transientPatterns = ['Popup never opened', 'Target closed', 'Navigation failed',
+    'net::', 'Timeout', 'timeout', 'frame was detached', 'Session closed', 'Connection closed',
+    'Protocol error', 'Target page, context or browser has been closed'];
+  const isTransient = transientPatterns.some(p => msg.includes(p));
+
+  if (isTransient) {
+    console.error(`[WARN] Transient error caught by unhandledRejection handler, continuing...`);
+    return; // Don't crash - let the worker/retry logic handle it
+  }
+
+  // For truly unexpected errors, still crash
+  console.error(`[CRASH] Fatal unhandled rejection, stopping process`);
   try {
     await supabase.from("jobs").update({
       status: "failed",
-      error_message: `Unhandled rejection: ${reason}`
+      error_message: `Unhandled rejection: ${msg}`
     }).eq("id", JOB_ID);
   } catch (e) {
     console.error(`Failed to update job status on rejection: ${e.message}`);
@@ -279,13 +294,17 @@ async function downloadTechPack(page, context, mainFrame, styleNo, workerId) {
     let page2 = null;
 
     for (let attempt = 1; attempt <= MAX_POPUP_RETRIES; attempt++) {
+      // Track the popup promise so we can always clean it up
+      let page2Promise = null;
       try {
         await mainFrame.locator("#txtStyleNo").fill("");
         await mainFrame.locator("#txtStyleNo").fill(styleNo);
         await mainFrame.getByRole("link", { name: "Search", exact: true }).click();
         await page.waitForTimeout(2000);
 
-        const page2Promise = page.waitForEvent("popup", { timeout: 30000 }).catch(() => { throw new Error("Popup never opened"); });
+        // IMPORTANT: Use .catch(()=>null) so this promise NEVER rejects unhandled.
+        // We check the result after awaiting instead.
+        page2Promise = page.waitForEvent("popup", { timeout: 30000 }).catch(() => null);
         const selectResult = await selectMostRecentResult(mainFrame, styleNo);
 
         if (!selectResult.success) {
@@ -299,8 +318,12 @@ async function downloadTechPack(page, context, mainFrame, styleNo, workerId) {
         } else { log("SEARCH", `[W${workerId}] Selected: ${selectResult.season}`); }
 
         page2 = await page2Promise;
+        if (!page2) throw new Error("Popup never opened");
         break; // Success - exit retry loop
       } catch (retryErr) {
+        // Always await the popup promise to prevent unhandled rejections
+        if (page2Promise) await page2Promise.catch(() => {});
+
         // Close any stray popups before retrying
         const pages = context.pages();
         for (const p of pages) { if (p !== page) await p.close().catch(() => {}); }
