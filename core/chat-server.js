@@ -385,6 +385,59 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Download extracted data as CSV
+  if (req.method === 'GET' && url.pathname.match(/^\/jobs\/[^/]+\/csv$/)) {
+    try {
+      const jobId = url.pathname.split('/')[2];
+      const { data: job, error: jobErr } = await supabase
+        .from('jobs')
+        .select('extracted_data, input_file_name, status')
+        .eq('id', jobId)
+        .single();
+
+      if (jobErr || !job) {
+        sendJSON(res, 404, { error: 'Job not found' });
+        return;
+      }
+
+      if (!job.extracted_data || !job.extracted_data.headers || !job.extracted_data.rows) {
+        sendJSON(res, 400, { error: 'Job has no extracted data yet. Status: ' + job.status });
+        return;
+      }
+
+      const { headers, rows } = job.extracted_data;
+
+      // Build CSV
+      const escapeCsv = (val) => {
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+      };
+
+      const csvLines = [headers.map(escapeCsv).join(',')];
+      for (const row of rows) {
+        csvLines.push(headers.map(h => escapeCsv(row[h] || '')).join(','));
+      }
+      const csvContent = csvLines.join('\n');
+
+      const filename = (job.input_file_name || 'export').replace(/\.[^.]+$/, '') + '_extracted.csv';
+
+      res.writeHead(200, {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.end(csvContent);
+    } catch (e) {
+      log(`CSV export error: ${e.message}`);
+      sendJSON(res, 500, { error: e.message });
+    }
+    return;
+  }
+
   // 404 for unknown routes
   sendJSON(res, 404, { error: 'Not found' });
 });
