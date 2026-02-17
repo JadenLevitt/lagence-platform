@@ -37,8 +37,11 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            # Install dependencies (skip optional deps to speed up)
-            npm install --production --no-optional 2>&1 | tail -5
+            # Install ALL dependencies (including devDeps needed for build)
+            npm install 2>&1 | tail -5
+
+            # Build frontend (Vite) + server (esbuild)
+            npm run build
 
             # Only install Playwright if not already present
             if [ ! -d "$HOME/.cache/ms-playwright/chromium-"* ]; then
@@ -48,14 +51,14 @@ jobs:
               echo "Playwright chromium already installed, skipping"
             fi
 
-            # Restart the server with PM2 (using Doppler for env vars)
+            # Restart the main server (now serves frontend + API from dist/)
             pm2 describe lagence-platform > /dev/null 2>&1
             if [ $? -eq 0 ]; then
               echo "Restarting existing PM2 process..."
               pm2 restart lagence-platform
             else
               echo "Starting new PM2 process..."
-              doppler run -- pm2 start core/chat-server.js --name lagence-platform
+              doppler run -- pm2 start dist/index.cjs --name lagence-platform
             fi
 
             # Start/restart the job watchdog (monitors for crashed jobs and auto-restarts)
