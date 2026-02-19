@@ -1,0 +1,32 @@
+{
+  "id": "email-outreach",
+  "name": "Email Outreach",
+  "description": "Send emails to internal teams to request missing data. When tech pack extraction produces incomplete results, Emma can contact the relevant team (production, design, editorial) to request the missing information.",
+  "status": "active",
+  "complexity": "medium",
+  "triggers": [
+    "email",
+    "send email",
+    "contact team",
+    "request data",
+    "missing data",
+    "reach out",
+    "ask production",
+    "ask design",
+    "notify team"
+  ],
+  "actions": [
+    "Look up which team owns the missing data fields",
+    "Draft an email requesting the specific missing information",
+    "Auto-send low-risk routine requests or show draft for approval",
+    "Send the email via Resend and log to database",
+    "Track email status and follow up if needed"
+  ],
+  "config_files": ["email-templates.js", "contacts-config.js"],
+  "example_requests": [
+    "Can you email production to get the fabric COO for these styles?",
+    "Some care instructions are missing - can you reach out to the right team?",
+    "Send a data request for the missing fields from the last job",
+    "Who should I contact about filling information?"
+  ]
+}

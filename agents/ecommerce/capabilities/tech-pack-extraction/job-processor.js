@@ -16,6 +16,23 @@ const {
   getAllFieldDefinitions
 } = require("./extraction-config");
 
+// Feedback loop integration: load learned preferences for extraction
+let learnedPreferences = [];
+try {
+  const { getActivePreferences } = require("../feedback-loop/feedback-processor");
+  getActivePreferences("ecommerce").then(prefs => {
+    learnedPreferences = prefs;
+    if (prefs.length > 0) {
+      console.log(`[FEEDBACK] Loaded ${prefs.length} learned preference(s) for extraction`);
+    }
+  }).catch(() => {});
+} catch (e) {
+  // feedback-loop module not available, continue without preferences
+}
+
+// Email outreach integration: detect missing data and draft outreach emails
+const { groupFieldsByTeam } = require("../email-outreach/contacts-config");
+
 const JOB_ID = process.argv[2];
 if (!JOB_ID) {
   console.error("Usage: node job-processor-full.js <job-id>");
@@ -577,7 +594,7 @@ async function extractAttributesFromPdf(pdfPath, styleNo, retryCount = 0) {
   try {
     const pdfBuffer = fs.readFileSync(pdfPath);
     const base64Pdf = pdfBuffer.toString("base64");
-    const extractionPrompt = buildExtractionPrompt(); // From extraction-config.js
+    const extractionPrompt = buildExtractionPrompt(learnedPreferences); // From extraction-config.js + learned preferences
 
     log("DEBUG", `Extraction prompt length: ${extractionPrompt.length} chars`);
 
@@ -923,6 +940,59 @@ async function main() {
     log("PHASE", `Extractions complete: ${successfulExtractions.length}/${stylesToExtract.length} succeeded, ${failedExtractions.length} failed`);
     if (failedExtractions.length > 0) {
       log("INFO", `Failed extractions: ${failedExtractions.map(r => r.styleNo).join(', ')}`);
+    }
+
+    // ========== PHASE 2.5: DETECT MISSING DATA FOR OUTREACH ==========
+    try {
+      const missingFields = new Set();
+      const missingStylesByField = {};
+
+      for (const result of successfulExtractions) {
+        if (!result.data) continue;
+        for (const [field, fieldData] of Object.entries(result.data)) {
+          const value = typeof fieldData === 'object' ? fieldData.value : fieldData;
+          const needsReview = typeof fieldData === 'object' ? fieldData.needs_review : false;
+
+          if ((!value || String(value).trim() === '') || needsReview) {
+            missingFields.add(field);
+            if (!missingStylesByField[field]) missingStylesByField[field] = [];
+            missingStylesByField[field].push(result.styleNo);
+          }
+        }
+      }
+
+      if (missingFields.size > 0) {
+        const grouped = groupFieldsByTeam([...missingFields]);
+        const teamCount = Object.keys(grouped).filter(t => t !== 'unknown').length;
+        log("OUTREACH", `Missing data detected: ${missingFields.size} field(s) across ${teamCount} team(s)`);
+
+        // Save outreach draft references to the job for the UI to display
+        for (const [team, fields] of Object.entries(grouped)) {
+          if (team === 'unknown') continue;
+          const styleNumbers = [...new Set(fields.flatMap(f => missingStylesByField[f] || []))];
+          log("OUTREACH", `  ${team}: ${fields.join(', ')} (${styleNumbers.length} styles)`);
+
+          // Create draft outreach email record (pending_approval)
+          try {
+            await supabase.from("outreach_emails").insert({
+              agent_id: "ecommerce",
+              job_id: JOB_ID,
+              template_id: "missing_data_request",
+              recipient_email: "", // Needs to be filled from team_contacts
+              recipient_team: team,
+              subject: `[L'AGENCE] Data Request: ${styleNumbers.length} style(s) missing information`,
+              html_body: `Missing fields: ${fields.join(', ')} for styles: ${styleNumbers.join(', ')}`,
+              status: "pending_approval",
+              risk_level: "low",
+              context: { fields, styleNumbers, team },
+            });
+          } catch (outreachErr) {
+            log("WARN", `Failed to create outreach draft for ${team}: ${outreachErr.message}`);
+          }
+        }
+      }
+    } catch (outreachDetectErr) {
+      log("WARN", `Missing data detection failed (non-fatal): ${outreachDetectErr.message}`);
     }
 
     // ========== PHASE 3: SAVE EXTRACTED DATA ==========

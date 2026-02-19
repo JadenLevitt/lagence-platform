@@ -1,0 +1,32 @@
+{
+  "id": "pdf-ingestion",
+  "name": "PDF Document Reader",
+  "description": "Upload any PDF document (line sheets, spec sheets, supplier docs) and the agent will read and extract relevant product data using Claude Vision.",
+  "status": "active",
+  "complexity": "high",
+  "triggers": [
+    "pdf",
+    "upload pdf",
+    "read document",
+    "line sheet",
+    "spec sheet",
+    "supplier doc",
+    "extract from pdf",
+    "document",
+    "upload document"
+  ],
+  "actions": [
+    "Accept PDF upload via chat or file upload",
+    "Store PDF in Supabase storage",
+    "Analyze PDF pages using Claude Vision",
+    "Extract structured data based on document type",
+    "Merge extracted data with existing job data (configurable priority)"
+  ],
+  "config_files": ["document-types.js"],
+  "example_requests": [
+    "Can you read this line sheet?",
+    "I have a supplier spec sheet with fabric details",
+    "Upload a PDF with care instruction data",
+    "What data can you extract from this document?"
+  ]
+}

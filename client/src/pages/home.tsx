@@ -183,11 +183,50 @@ export default function Home() {
   };
 
   const processFile = async (file: File) => {
-    if (!file.name.endsWith('.csv')) {
-      alert("Please upload a CSV file");
+    const isPdf = file.name.toLowerCase().endsWith('.pdf');
+    const isCsv = file.name.toLowerCase().endsWith('.csv');
+
+    if (!isCsv && !isPdf) {
+      alert("Please upload a CSV or PDF file");
       return;
     }
 
+    // Handle PDF uploads — send to documents endpoint
+    if (isPdf) {
+      setSelectedFile(file);
+      setUploadState("uploading");
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+
+        const uploadRes = await fetch("/api/documents/upload", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!uploadRes.ok) throw new Error("Failed to upload PDF");
+
+        const uploadData = await uploadRes.json();
+
+        // Trigger extraction
+        await fetch(`/api/documents/${uploadData.document.id}/extract`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+
+        alert(`PDF "${file.name}" uploaded and extraction started. Check the chat for results.`);
+        setUploadState("idle");
+        setSelectedFile(null);
+      } catch (err) {
+        console.error("PDF upload failed:", err);
+        alert("Failed to upload PDF. Please try again.");
+        setUploadState("idle");
+        setSelectedFile(null);
+      }
+      return;
+    }
+
+    // Handle CSV uploads — existing flow
     setSelectedFile(file);
     setUploadState("uploading");
 
@@ -358,7 +397,7 @@ export default function Home() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".csv"
+                  accept=".csv,.pdf"
                   onChange={handleFileSelect}
                   className="hidden"
                   data-testid="input-file-upload"
@@ -390,7 +429,7 @@ export default function Home() {
                           <Upload className="w-5 h-5 stroke-[1.5]" />
                         </div>
                         
-                        <p className="font-medium mb-2">Drop your CSV here</p>
+                        <p className="font-medium mb-2">Drop your CSV or PDF here</p>
                         <p className="text-sm text-muted-foreground">or click to browse</p>
                         
                         <Button 

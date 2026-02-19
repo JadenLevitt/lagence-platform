@@ -33,6 +33,24 @@ const { getAllFieldDefinitions } = loadModule(
   "agents/ecommerce/capabilities/tech-pack-extraction/extraction-config"
 );
 
+// Shared services
+const { sendEmail, isEmailConfigured } = loadModule("shared/email-service");
+const { mergeDataSources } = loadModule("shared/data-merger");
+
+// Capability modules
+const { processFeedbackPatterns, getActivePreferences } = loadModule(
+  "agents/ecommerce/capabilities/feedback-loop/feedback-processor"
+);
+const { processDocument } = loadModule(
+  "agents/ecommerce/capabilities/pdf-ingestion/pdf-processor"
+);
+const { renderTemplate, getAvailableTemplates } = loadModule(
+  "agents/ecommerce/capabilities/email-outreach/email-templates"
+);
+const { groupFieldsByTeam } = loadModule(
+  "agents/ecommerce/capabilities/email-outreach/contacts-config"
+);
+
 // Agent auto-reload (hot-reload during development)
 let agents: Record<string, any> = loadAllAgents();
 console.log(`Loaded agents: ${Object.keys(agents).join(", ") || "none"}`);
@@ -776,6 +794,559 @@ export async function registerRoutes(
       console.error(`CSV export error: ${e.message}`);
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // ═══════════════════════════════════════════════════
+  // ─── Feedback Loop Endpoints ───
+  // ═══════════════════════════════════════════════════
+
+  // Submit feedback (response rating or field correction)
+  app.post("/api/feedback", async (req, res) => {
+    try {
+      const {
+        feedback_type,
+        rating,
+        job_id,
+        field_name,
+        original_value,
+        corrected_value,
+        style_number,
+        user_comment,
+        chat_context,
+        agent_id,
+      } = req.body;
+
+      if (!feedback_type) {
+        return res
+          .status(400)
+          .json({ error: "feedback_type is required" });
+      }
+
+      const { data, error } = await supabase
+        .from("user_feedback")
+        .insert({
+          agent_id: agent_id || "ecommerce",
+          feedback_type,
+          rating: rating || null,
+          job_id: job_id || null,
+          field_name: field_name || null,
+          original_value: original_value || null,
+          corrected_value: corrected_value || null,
+          style_number: style_number || null,
+          user_comment: user_comment || null,
+          chat_context: chat_context || {},
+        })
+        .select()
+        .single();
+
+      if (error) {
+        return res
+          .status(500)
+          .json({ error: "Failed to save feedback", details: error.message });
+      }
+
+      return res.json({ success: true, feedback: data });
+    } catch (e: any) {
+      console.error("Feedback error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // List feedback
+  app.get("/api/feedback", async (req, res) => {
+    try {
+      let query = supabase
+        .from("user_feedback")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+      if (req.query.agent_id) query = query.eq("agent_id", req.query.agent_id);
+      if (req.query.job_id) query = query.eq("job_id", req.query.job_id);
+      if (req.query.field_name)
+        query = query.eq("field_name", req.query.field_name);
+      if (req.query.feedback_type)
+        query = query.eq("feedback_type", req.query.feedback_type);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Get active learned preferences
+  app.get("/api/learned-preferences", async (req, res) => {
+    try {
+      const agentId = (req.query.agent_id as string) || "ecommerce";
+      const preferences = await getActivePreferences(agentId);
+      return res.json(preferences);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Toggle a learned preference on/off
+  app.post("/api/learned-preferences/:id/toggle", async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      // Get current state
+      const { data: pref, error: fetchErr } = await supabase
+        .from("learned_preferences")
+        .select("is_active")
+        .eq("id", id)
+        .single();
+
+      if (fetchErr || !pref) {
+        return res.status(404).json({ error: "Preference not found" });
+      }
+
+      const { data, error } = await supabase
+        .from("learned_preferences")
+        .update({ is_active: !pref.is_active })
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Manually trigger feedback pattern analysis
+  app.post("/api/feedback/process", async (req, res) => {
+    try {
+      const agentId = req.body.agent_id || "ecommerce";
+      const result = await processFeedbackPatterns(agentId);
+      return res.json(result);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════
+  // ─── PDF Ingestion Endpoints ───
+  // ═══════════════════════════════════════════════════
+
+  // Upload a PDF document
+  app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
+    try {
+      const file = req.file;
+      if (!file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      if (!file.mimetype.includes("pdf")) {
+        return res
+          .status(400)
+          .json({ error: "Only PDF files are supported" });
+      }
+
+      const storagePath = `${Date.now()}_${file.originalname}`;
+
+      // Upload to Supabase storage (documents bucket)
+      const { error: uploadError } = await supabase.storage
+        .from("documents")
+        .upload(storagePath, file.buffer, {
+          contentType: "application/pdf",
+          upsert: false,
+        });
+
+      if (uploadError) {
+        return res.status(500).json({
+          error: "Failed to upload file",
+          details: uploadError.message,
+        });
+      }
+
+      // Create document record
+      const { data: doc, error: insertError } = await supabase
+        .from("uploaded_documents")
+        .insert({
+          file_name: file.originalname,
+          storage_path: storagePath,
+          document_type: req.body.document_type || null,
+          job_id: req.body.job_id || null,
+          agent_id: req.body.agent_id || "ecommerce",
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        return res.status(500).json({
+          error: "Failed to create document record",
+          details: insertError.message,
+        });
+      }
+
+      return res.json({ success: true, document: doc });
+    } catch (e: any) {
+      console.error("Document upload error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Trigger extraction on an uploaded document
+  app.post("/api/documents/:id/extract", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await processDocument(id);
+      return res.json({ success: true, result });
+    } catch (e: any) {
+      console.error("Document extraction error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Get a document and its extracted data
+  app.get("/api/documents/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { data, error } = await supabase
+        .from("uploaded_documents")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (error || !data) {
+        return res.status(404).json({ error: "Document not found" });
+      }
+
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // List uploaded documents
+  app.get("/api/documents", async (req, res) => {
+    try {
+      let query = supabase
+        .from("uploaded_documents")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (req.query.job_id) query = query.eq("job_id", req.query.job_id);
+      if (req.query.document_type)
+        query = query.eq("document_type", req.query.document_type);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Merge extracted PDF data into a job using data-merger
+  app.post("/api/documents/:id/merge/:jobId", async (req, res) => {
+    try {
+      const { id, jobId } = req.params;
+
+      // Get document extracted data
+      const { data: doc, error: docErr } = await supabase
+        .from("uploaded_documents")
+        .select("extracted_data, document_type")
+        .eq("id", id)
+        .single();
+
+      if (docErr || !doc) {
+        return res.status(404).json({ error: "Document not found" });
+      }
+
+      if (!doc.extracted_data || Object.keys(doc.extracted_data).length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Document has no extracted data" });
+      }
+
+      // Get job extracted data
+      const { data: job, error: jobErr } = await supabase
+        .from("jobs")
+        .select("extracted_data")
+        .eq("id", jobId)
+        .single();
+
+      if (jobErr || !job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      // Use custom priority if provided, otherwise defaults
+      const priorityConfig = req.body.priority || undefined;
+
+      const sources = [
+        { source_type: "tech_pack", data: job.extracted_data || {} },
+        { source_type: "uploaded_pdf", data: doc.extracted_data },
+      ];
+
+      const { merged, provenance } = mergeDataSources(sources, priorityConfig);
+
+      // Link document to job
+      await supabase
+        .from("uploaded_documents")
+        .update({ job_id: jobId })
+        .eq("id", id);
+
+      return res.json({ merged, provenance });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Update source priority for a job
+  app.put("/api/jobs/:id/priority", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { priority } = req.body;
+
+      if (!priority || typeof priority !== "object") {
+        return res.status(400).json({ error: "priority object is required" });
+      }
+
+      // Store priority config on the job record (using supplementary_files JSONB)
+      const { data, error } = await supabase
+        .from("jobs")
+        .update({
+          supplementary_files: { ...((await supabase.from("jobs").select("supplementary_files").eq("id", id).single()).data?.supplementary_files || {}), priority_config: priority },
+        })
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json({ success: true, job: data });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════
+  // ─── Email Outreach Endpoints ───
+  // ═══════════════════════════════════════════════════
+
+  // List team contacts
+  app.get("/api/team-contacts", async (_req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from("team_contacts")
+        .select("*")
+        .eq("is_active", true)
+        .order("team_name");
+
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Add or update a team contact
+  app.post("/api/team-contacts", async (req, res) => {
+    try {
+      const { team_name, contact_name, email, data_domains, agent_id } =
+        req.body;
+
+      if (!team_name || !contact_name || !email) {
+        return res
+          .status(400)
+          .json({ error: "team_name, contact_name, and email are required" });
+      }
+
+      const { data, error } = await supabase
+        .from("team_contacts")
+        .upsert(
+          {
+            team_name,
+            contact_name,
+            email,
+            data_domains: data_domains || [],
+            agent_id: agent_id || "ecommerce",
+            is_active: true,
+          },
+          { onConflict: "team_name,agent_id" }
+        )
+        .select()
+        .single();
+
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json({ success: true, contact: data });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Draft an outreach email
+  app.post("/api/outreach/draft", async (req, res) => {
+    try {
+      const {
+        template_id,
+        recipient_email,
+        recipient_team,
+        context: emailContext,
+        job_id,
+        agent_id,
+      } = req.body;
+
+      if (!template_id || !recipient_email) {
+        return res
+          .status(400)
+          .json({ error: "template_id and recipient_email are required" });
+      }
+
+      // Render the email template
+      const { subject, html, risk } = renderTemplate(
+        template_id,
+        emailContext || {}
+      );
+
+      // Determine status based on risk level
+      const status = risk === "low" ? "auto_approved" : "pending_approval";
+
+      // Save to outreach_emails
+      const { data, error } = await supabase
+        .from("outreach_emails")
+        .insert({
+          agent_id: agent_id || "ecommerce",
+          job_id: job_id || null,
+          template_id,
+          recipient_email,
+          recipient_team: recipient_team || null,
+          subject,
+          html_body: html,
+          status,
+          risk_level: risk,
+          context: emailContext || {},
+        })
+        .select()
+        .single();
+
+      if (error) {
+        return res
+          .status(500)
+          .json({ error: "Failed to save draft", details: error.message });
+      }
+
+      // If auto-approved (low risk), send immediately
+      if (status === "auto_approved" && isEmailConfigured()) {
+        try {
+          const sendResult = await sendEmail({
+            to: recipient_email,
+            subject,
+            html,
+          });
+
+          await supabase
+            .from("outreach_emails")
+            .update({
+              status: "sent",
+              sent_at: new Date().toISOString(),
+              resend_message_id: sendResult.id || null,
+            })
+            .eq("id", data.id);
+
+          return res.json({
+            success: true,
+            email: { ...data, status: "sent" },
+            auto_sent: true,
+          });
+        } catch (sendErr: any) {
+          console.error("Auto-send failed:", sendErr.message);
+          // Still saved as draft, just not sent
+          return res.json({
+            success: true,
+            email: data,
+            auto_sent: false,
+            send_error: sendErr.message,
+          });
+        }
+      }
+
+      return res.json({ success: true, email: data, auto_sent: false });
+    } catch (e: any) {
+      console.error("Outreach draft error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Approve and send an outreach email
+  app.post("/api/outreach/:id/approve", async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const { data: email, error: fetchErr } = await supabase
+        .from("outreach_emails")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (fetchErr || !email) {
+        return res.status(404).json({ error: "Email not found" });
+      }
+
+      if (email.status === "sent") {
+        return res.status(400).json({ error: "Email already sent" });
+      }
+
+      if (!isEmailConfigured()) {
+        return res
+          .status(500)
+          .json({ error: "Email service not configured (missing RESEND_API_KEY)" });
+      }
+
+      const sendResult = await sendEmail({
+        to: email.recipient_email,
+        subject: email.subject,
+        html: email.html_body,
+      });
+
+      const { data, error } = await supabase
+        .from("outreach_emails")
+        .update({
+          status: "sent",
+          sent_at: new Date().toISOString(),
+          approved_by: req.body.approved_by || "web-user",
+          resend_message_id: sendResult.id || null,
+        })
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json({ success: true, email: data });
+    } catch (e: any) {
+      console.error("Outreach approve error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // List outreach email history
+  app.get("/api/outreach", async (req, res) => {
+    try {
+      let query = supabase
+        .from("outreach_emails")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (req.query.job_id) query = query.eq("job_id", req.query.job_id);
+      if (req.query.status) query = query.eq("status", req.query.status);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Get available email templates
+  app.get("/api/outreach/templates", (_req, res) => {
+    res.json({ templates: getAvailableTemplates() });
   });
 
   return httpServer;

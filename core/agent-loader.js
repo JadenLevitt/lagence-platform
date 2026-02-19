@@ -79,12 +79,20 @@ function loadAgentCapabilities(agentId) {
  * Load extraction config for a capability (if it has one)
  */
 function loadExtractionConfig(agentId, capabilityId) {
+  return loadCapabilityConfig(agentId, capabilityId, 'extraction-config.js');
+}
+
+/**
+ * Load any config file for a capability by filename.
+ * Clears require cache to get fresh data on hot-reload.
+ */
+function loadCapabilityConfig(agentId, capabilityId, fileName) {
   const configPath = path.join(
     AGENTS_DIR,
     agentId,
     'capabilities',
     capabilityId,
-    'extraction-config.js'
+    fileName
   );
 
   if (fs.existsSync(configPath)) {
@@ -126,6 +134,24 @@ ${cap.actions?.map(a => `- ${a}`).join('\n') || '- No specific actions defined'}
       capabilitiesText += `
 Extractable Fields:
 ${fields.map(f => `- ${f.field_name}: ${f.extraction_logic}`).join('\n')}
+`;
+    }
+
+    // If this capability has a contacts config, include team directory
+    const contactsConfig = loadCapabilityConfig(agentId, cap.id, 'contacts-config.js');
+    if (contactsConfig && contactsConfig.DEFAULT_CONTACTS) {
+      capabilitiesText += `
+Team Directory:
+${contactsConfig.DEFAULT_CONTACTS.map(c => `- ${c.team_name}: owns ${c.data_domains.join(', ')}`).join('\n')}
+`;
+    }
+
+    // If this capability has document types, include them
+    const docTypesConfig = loadCapabilityConfig(agentId, cap.id, 'document-types.js');
+    if (docTypesConfig && docTypesConfig.DOCUMENT_TYPES) {
+      capabilitiesText += `
+Supported Document Types:
+${Object.entries(docTypesConfig.DOCUMENT_TYPES).map(([key, dt]) => `- ${dt.label}`).join('\n')}
 `;
     }
   }
@@ -187,6 +213,7 @@ module.exports = {
   loadAllAgents,
   loadAgentCapabilities,
   loadExtractionConfig,
+  loadCapabilityConfig,
   buildAgentSystemPrompt,
   getAgent,
   getAgentIds

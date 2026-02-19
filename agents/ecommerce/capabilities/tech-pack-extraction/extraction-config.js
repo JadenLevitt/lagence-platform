@@ -147,7 +147,7 @@ const FIELD_DEFINITIONS = [
 /**
  * Build the Claude extraction prompt from field definitions
  */
-function buildExtractionPrompt() {
+function buildExtractionPrompt(learnedPreferences) {
   const techPackFields = FIELD_DEFINITIONS.filter(f => f.source === 'tech_pack');
 
   let fieldList = techPackFields.map((f, i) => {
@@ -157,6 +157,14 @@ function buildExtractionPrompt() {
     }
     return instruction;
   }).join('\n');
+
+  // Append learned corrections from user feedback
+  let learnedSection = '';
+  if (learnedPreferences && learnedPreferences.length > 0) {
+    learnedSection = `\n\nLEARNED CORRECTIONS (from previous user feedback — follow these rules):\n${
+      learnedPreferences.map(p => `- ${p.field_name}: ${p.rule}`).join('\n')
+    }\n`;
+  }
 
   return `Extract data from this L'AGENCE tech pack PDF. Return ONLY a JSON object - no other text.
 
@@ -189,7 +197,7 @@ RESPONSE FORMAT - Return ONLY this JSON structure, starting with { and ending wi
   "OCCASION (DRESSES ONLY)": {"value": "", "logic": "Not a dress", "needs_review": false}
 }
 
-CRITICAL: Your response must start with { and end with } - no explanatory text before or after.`;
+CRITICAL: Your response must start with { and end with } - no explanatory text before or after.${learnedSection}`;
 }
 
 /**

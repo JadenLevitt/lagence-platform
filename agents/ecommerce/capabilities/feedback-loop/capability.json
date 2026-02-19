@@ -1,0 +1,33 @@
+{
+  "id": "feedback-loop",
+  "name": "Learning & Feedback",
+  "description": "Captures user feedback on responses and extracted data. Uses feedback patterns to improve extraction prompts and agent behavior over time.",
+  "status": "active",
+  "complexity": "medium",
+  "triggers": [
+    "feedback",
+    "correction",
+    "wrong",
+    "fix",
+    "improve",
+    "that's not right",
+    "actually",
+    "should be",
+    "learned",
+    "preferences"
+  ],
+  "actions": [
+    "Capture thumbs up/down on chat responses",
+    "Record field-level corrections to extracted data",
+    "Aggregate feedback patterns into learned preferences",
+    "Update extraction prompts based on corrections",
+    "Show feedback history and learned rules"
+  ],
+  "config_files": ["feedback-processor.js"],
+  "example_requests": [
+    "The RTW FIT for style 1234 should be Relaxed, not Regular",
+    "You keep getting the sleeve length wrong for jackets",
+    "That extraction was perfect, nice work",
+    "Show me what you've learned from my corrections"
+  ]
+}
