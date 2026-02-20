@@ -310,13 +310,58 @@ export async function registerRoutes(
         messages: body.messages,
       });
 
-      const assistantMessage = response.content[0].text;
+      const rawMessage = response.content[0].text;
+
+      // Check if Claude included a rule-setting action in the response
+      let assistantMessage = rawMessage;
+      let actionTaken: any = null;
+
+      const actionMatch = rawMessage.match(/\{[^{}]*"action_type"\s*:\s*"set_extraction_rule"[^{}]*\}/);
+      if (actionMatch) {
+        try {
+          const action = JSON.parse(actionMatch[0]);
+          if (action.field_name && action.rule_description) {
+            // Strip the JSON block from the visible message
+            assistantMessage = rawMessage.replace(actionMatch[0], "").trim();
+
+            // Save as a learned preference
+            const { error: ruleError } = await supabase
+              .from("learned_preferences")
+              .upsert(
+                {
+                  agent_id: agentId,
+                  preference_type: "extraction_rule",
+                  field_name: action.field_name,
+                  rule: action.rule_description,
+                  evidence_count: 1,
+                  confidence: action.confidence || 0.8,
+                  is_active: true,
+                  source_feedback_ids: [],
+                },
+                { onConflict: "agent_id,preference_type,field_name" }
+              );
+
+            if (!ruleError) {
+              actionTaken = {
+                type: "extraction_rule_created",
+                field_name: action.field_name,
+                rule: action.rule_description,
+              };
+              console.log(`[CHAT] Saved extraction rule for ${action.field_name}: ${action.rule_description}`);
+            } else {
+              console.error(`[CHAT] Failed to save rule: ${ruleError.message}`);
+            }
+          }
+        } catch {
+          // JSON parse failed — not a valid action, return full message as-is
+        }
+      }
 
       res.json({
         agent: { id: agent.id, name: agent.name },
         message: assistantMessage,
         classification,
-        action_taken: null,
+        action_taken: actionTaken,
       });
     } catch (e: any) {
       console.error(`Chat error: ${e.message}`);

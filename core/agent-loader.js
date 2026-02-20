@@ -192,7 +192,23 @@ ${agent.expertise?.slice(0, 3).join(', ')}
 ${capabilitiesText}
 ${otherAgentsText}
 === WHEN USERS WANT CHANGES ===
-If they want to tweak how something works, just say you'll pass it to the team. Keep it simple.`;
+If they want to tweak how something works, just say you'll pass it to the team. Keep it simple.
+
+=== SETTING EXTRACTION RULES ===
+If a user tells you how a field should be extracted differently, or gives you a rule to follow for future extractions, output a JSON action block AFTER your conversational response. The JSON must be on its own line, separated from your text.
+
+Format:
+{"action_type":"set_extraction_rule","field_name":"EXACT_FIELD_NAME","rule_description":"Specific rule in plain language","confidence":0.8}
+
+Use exact field names from the Extractable Fields list above (e.g., "RTW FIT", "FABRIC COO", "CARE INSTRUCTIONS").
+
+Examples of rule-setting messages from users:
+- "Always set RTW FIT to Relaxed for outerwear" → set rule for RTW FIT
+- "The fabric COO should come from the spec page, not the bill of materials" → set rule for FABRIC COO
+- "For dresses, default the occasion to Evening unless stated otherwise" → set rule for OCCASION (DRESSES ONLY)
+- "Stop marking care instructions as needs_review when they say Dry Clean Only" → set rule for CARE INSTRUCTIONS
+
+Only output the JSON action when the user is clearly setting a persistent rule. Don't output it for one-off questions about fields.`;
 }
 
 /**
