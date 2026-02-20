@@ -494,6 +494,61 @@ export async function registerRoutes(
     }
   });
 
+  // ─── Job Extracted Data (for review/correction UI) ───
+  app.get("/api/jobs/:id/extracted", async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const idValidation = uuidSchema.safeParse(id);
+      if (!idValidation.success) {
+        return res.status(400).json({ error: "Invalid job ID format" });
+      }
+
+      const { data: job, error } = await supabase
+        .from("jobs")
+        .select("extracted_data, status, input_file_name")
+        .eq("id", id)
+        .single();
+
+      if (error || !job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      if (!job.extracted_data || !job.extracted_data.rows) {
+        return res.status(400).json({
+          error: "No extracted data available",
+          status: job.status,
+        });
+      }
+
+      const { headers, rows, logicHeaders } = job.extracted_data;
+
+      // Transform rows into per-style field entries for the review UI
+      const styles = (rows as Record<string, string>[]).map((row) => {
+        const styleNo = row["STYLE NO"] || row["Style No"] || "Unknown";
+        const fields = (headers as string[])
+          .filter((h) => h !== "STYLE NO" && h !== "Style No")
+          .map((fieldName) => ({
+            field_name: fieldName,
+            value: row[fieldName] || "",
+            needs_review:
+              !row[fieldName] || String(row[fieldName]).trim() === "",
+          }));
+        return { style_number: styleNo, fields };
+      });
+
+      return res.json({
+        job_id: id,
+        status: job.status,
+        file_name: job.input_file_name,
+        headers: headers,
+        styles,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
   // ─── Jobs List ───
   app.get("/api/jobs", async (_req, res) => {
     try {
@@ -845,7 +900,25 @@ export async function registerRoutes(
           .json({ error: "Failed to save feedback", details: error.message });
       }
 
-      return res.json({ success: true, feedback: data });
+      // Auto-trigger feedback processing when enough field corrections accumulate
+      let autoProcessed = false;
+      if (feedback_type === "field_correction" && field_name) {
+        const { count } = await supabase
+          .from("user_feedback")
+          .select("*", { count: "exact", head: true })
+          .eq("feedback_type", "field_correction")
+          .eq("field_name", field_name)
+          .eq("applied_to_config", false);
+
+        if (count && count >= 3) {
+          processFeedbackPatterns(agent_id || "ecommerce").catch((err: any) =>
+            console.error("Auto-processing feedback failed:", err.message)
+          );
+          autoProcessed = true;
+        }
+      }
+
+      return res.json({ success: true, feedback: data, auto_processed: autoProcessed });
     } catch (e: any) {
       console.error("Feedback error:", e.message);
       return res.status(500).json({ error: e.message });

@@ -7,12 +7,13 @@ import ChatWidget from "@/components/chat-widget";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { 
-  Loader2, 
-  Upload, 
-  CheckCircle2, 
-  ExternalLink, 
-  Clock, 
+import { toast } from "sonner";
+import {
+  Loader2,
+  Upload,
+  CheckCircle2,
+  ExternalLink,
+  Clock,
   AlertCircle,
   FileSpreadsheet,
   Plus,
@@ -23,7 +24,10 @@ import {
   TrendingUp,
   Users,
   Zap,
-  ArrowRight
+  ArrowRight,
+  Search,
+  Pencil,
+  Check
 } from "lucide-react";
 
 declare global {
@@ -72,6 +76,25 @@ interface Job {
   errorMessage: string | null;
 }
 
+interface ExtractedField {
+  field_name: string;
+  value: string;
+  needs_review: boolean;
+}
+
+interface ExtractedStyle {
+  style_number: string;
+  fields: ExtractedField[];
+}
+
+interface ExtractedDataResponse {
+  job_id: string;
+  status: string;
+  file_name: string;
+  headers: string[];
+  styles: ExtractedStyle[];
+}
+
 export default function Home() {
   const [, setLocation] = useLocation();
   const searchString = useSearch();
@@ -88,6 +111,10 @@ export default function Home() {
   const [googleClientId, setGoogleClientId] = useState<string | null>(null);
   const [showInstructions, setShowInstructions] = useState(false);
   const [showProductivityGains, setShowProductivityGains] = useState(false);
+  const [reviewingJobId, setReviewingJobId] = useState<string | null>(null);
+  const [editingField, setEditingField] = useState<{ styleNo: string; fieldName: string; originalValue: string } | null>(null);
+  const [correctedValue, setCorrectedValue] = useState("");
+  const [correctedFields, setCorrectedFields] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -127,6 +154,48 @@ export default function Home() {
       return 3000;
     }
   });
+
+  const { data: extractedData, isLoading: extractedLoading } = useQuery<ExtractedDataResponse>({
+    queryKey: ["/api/jobs", reviewingJobId, "extracted"],
+    queryFn: async () => {
+      const res = await fetch(`/api/jobs/${reviewingJobId}/extracted`);
+      if (!res.ok) throw new Error("Failed to fetch extracted data");
+      return res.json();
+    },
+    enabled: !!reviewingJobId,
+  });
+
+  const submitCorrection = async () => {
+    if (!editingField || !reviewingJobId) return;
+    try {
+      const res = await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          feedback_type: "field_correction",
+          field_name: editingField.fieldName,
+          original_value: editingField.originalValue,
+          corrected_value: correctedValue,
+          style_number: editingField.styleNo,
+          job_id: reviewingJobId,
+          agent_id: "ecommerce",
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCorrectedFields(prev => new Set(prev).add(`${editingField.styleNo}:${editingField.fieldName}`));
+        setEditingField(null);
+        setCorrectedValue("");
+        if (data.auto_processed) {
+          toast.success("Correction submitted — Emma is learning from your feedback");
+        } else {
+          toast.success("Correction submitted");
+        }
+      }
+    } catch {
+      toast.error("Failed to submit correction");
+    }
+  };
 
   const startJobMutation = useMutation({
     mutationFn: async ({ file, rowCount }: { file: File; rowCount: number }) => {
@@ -604,10 +673,99 @@ export default function Home() {
                             )}
                             {job.status === "failed" && (
                               <p className="text-xs text-red-600 mt-2 break-words">
-                                {job.errorMessage?.includes("download") 
+                                {job.errorMessage?.includes("download")
                                   ? "Could not process file. Please try uploading again."
                                   : job.errorMessage || "Processing failed. Please try again."}
                               </p>
+                            )}
+                            {(job.status === "completed" || job.status === "ready_for_export") && (
+                              <div className="mt-2">
+                                <button
+                                  onClick={() => {
+                                    setReviewingJobId(reviewingJobId === job.id ? null : job.id);
+                                    setEditingField(null);
+                                  }}
+                                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-black transition-colors"
+                                >
+                                  <Search className="w-3 h-3" />
+                                  {reviewingJobId === job.id ? "Hide Review" : "Review & Correct Data"}
+                                </button>
+                                {reviewingJobId === job.id && (
+                                  <div className="mt-3 border-t border-border pt-3">
+                                    {extractedLoading ? (
+                                      <div className="flex items-center gap-2 py-4 justify-center text-muted-foreground">
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        <span className="text-xs">Loading extracted data...</span>
+                                      </div>
+                                    ) : extractedData?.styles?.length ? (
+                                      <div className="space-y-3 max-h-[500px] overflow-y-auto">
+                                        {extractedData.styles.map((style) => (
+                                          <div key={style.style_number} className="border border-border/50 bg-secondary/10 p-3">
+                                            <p className="text-xs font-medium mb-2 uppercase tracking-wider">{style.style_number}</p>
+                                            <div className="space-y-1">
+                                              {style.fields.map((field) => {
+                                                const fieldKey = `${style.style_number}:${field.field_name}`;
+                                                const isCorrected = correctedFields.has(fieldKey);
+                                                const isEditing = editingField?.styleNo === style.style_number && editingField?.fieldName === field.field_name;
+                                                return (
+                                                  <div key={field.field_name} className="flex items-start gap-2 text-xs">
+                                                    <span className="text-muted-foreground w-[140px] flex-shrink-0 truncate" title={field.field_name}>
+                                                      {field.field_name}
+                                                    </span>
+                                                    {isEditing ? (
+                                                      <div className="flex-1 flex items-center gap-1">
+                                                        <input
+                                                          type="text"
+                                                          value={correctedValue}
+                                                          onChange={(e) => setCorrectedValue(e.target.value)}
+                                                          className="flex-1 border border-border px-2 py-0.5 text-xs bg-white"
+                                                          autoFocus
+                                                          onKeyDown={(e) => {
+                                                            if (e.key === "Enter") submitCorrection();
+                                                            if (e.key === "Escape") { setEditingField(null); setCorrectedValue(""); }
+                                                          }}
+                                                        />
+                                                        <button onClick={submitCorrection} className="p-0.5 text-green-600 hover:bg-green-50 rounded">
+                                                          <Check className="w-3 h-3" />
+                                                        </button>
+                                                        <button onClick={() => { setEditingField(null); setCorrectedValue(""); }} className="p-0.5 text-muted-foreground hover:bg-secondary rounded">
+                                                          <X className="w-3 h-3" />
+                                                        </button>
+                                                      </div>
+                                                    ) : (
+                                                      <div className="flex-1 flex items-center gap-1 group">
+                                                        <span className={`${field.needs_review ? "text-amber-600" : ""} ${isCorrected ? "line-through text-muted-foreground" : ""}`}>
+                                                          {field.value || <span className="italic text-muted-foreground/50">empty</span>}
+                                                        </span>
+                                                        {isCorrected ? (
+                                                          <Check className="w-3 h-3 text-green-600 flex-shrink-0" />
+                                                        ) : (
+                                                          <button
+                                                            onClick={() => {
+                                                              setEditingField({ styleNo: style.style_number, fieldName: field.field_name, originalValue: field.value });
+                                                              setCorrectedValue(field.value);
+                                                            }}
+                                                            className="p-0.5 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-black transition-all flex-shrink-0"
+                                                            title="Correct this value"
+                                                          >
+                                                            <Pencil className="w-3 h-3" />
+                                                          </button>
+                                                        )}
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <p className="text-xs text-muted-foreground text-center py-4">No extracted data available</p>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
                             )}
                           </div>
                         ))}
