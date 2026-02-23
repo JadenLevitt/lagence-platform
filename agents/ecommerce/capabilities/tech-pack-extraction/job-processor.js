@@ -249,6 +249,294 @@ function readStylesFromCSV(csvPath) {
   return { uniqueStyles, styleToRows: styleMap, header, headerMap };
 }
 
+// ========== SUPPLEMENTARY DATA SOURCE PARSERS ==========
+
+/**
+ * Parse an ITEM ID into its numeric style number and alpha fabric code.
+ * e.g. "2789NGX-BLK" → { styleNumber: "2789", fabricCode: "NGX" }
+ * e.g. "2789-BLK" → { styleNumber: "2789", fabricCode: "" }
+ */
+function parseItemIdParts(itemId) {
+  const prefix = (itemId || "").split("-")[0];
+  const match = prefix.match(/^(\d+)([A-Za-z].*)$/);
+  if (match) {
+    return { styleNumber: match[1], fabricCode: match[2].toUpperCase() };
+  }
+  // No alpha suffix — prefix is purely numeric (or empty)
+  return { styleNumber: prefix, fabricCode: "" };
+}
+
+/**
+ * Parse a fabric workbook CSV into a lookup map.
+ * Handles section-based layout (SILKS, SOFT WOVEN, SUITING, DENIM, etc.)
+ * Returns: Map<fabricCode, { composition, coo, description, category }>
+ */
+function parseFabricWorkbook(csvPath) {
+  const content = fs.readFileSync(csvPath, "utf-8");
+  const lines = content.trim().split("\n");
+  const fabricMap = {};
+  let currentCategory = "";
+
+  // Known section headers (all caps, appear as standalone labels)
+  const sectionKeywords = [
+    "SILKS", "SOFT WOVEN", "SUITING", "TWEEDS", "LEATHERS", "OUTERWEAR",
+    "SWEATER FULLY FASHIONED KNITS", "CUT & SEW KNITS", "LACE",
+    "NOVELTY FABRIC", "DENIM", "INDIA EMBELLISHMENTS", "TRIMS",
+    "non-stretch", "Subtle Stretch", "Super Stretch"
+  ];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const cols = parseCSVLine(trimmed);
+    const cleanCols = cols.map(c => c.replace(/^\"|\"$/g, "").trim());
+
+    // Check if this line is a section header
+    const firstCol = cleanCols[0] || "";
+    const isSectionHeader = sectionKeywords.some(kw =>
+      firstCol.toUpperCase() === kw.toUpperCase()
+    );
+    if (isSectionHeader) {
+      // Map sub-categories back to parent denim category
+      const upper = firstCol.toUpperCase();
+      if (["NON-STRETCH", "SUBTLE STRETCH", "SUPER STRETCH"].includes(upper)) {
+        currentCategory = "DENIM";
+      } else {
+        currentCategory = upper;
+      }
+      continue;
+    }
+
+    // Skip header rows (CODE, FABRIC COMPOSITION, ...) and metadata rows
+    if (firstCol.toUpperCase() === "CODE" || firstCol.toUpperCase() === "FABRIC CODE GUIDE") continue;
+    if (firstCol.toUpperCase() === "PROD GROUP") continue;
+
+    // A valid fabric row has a short alpha code in the first column
+    const code = firstCol.replace(/\s+/g, "").toUpperCase();
+    if (!code || code.length > 10 || /^\d+$/.test(code)) continue;
+
+    // Skip rows that look like trim mappings (contain style numbers with commas)
+    if (code.includes(",") || /^\d{4,}/.test(code)) continue;
+
+    const composition = (cleanCols[1] || "").trim();
+    const coo = (cleanCols[2] || "").trim();
+    const description = (cleanCols[3] || "").trim();
+
+    // Only store if we have at least a code and some data
+    if (composition || coo || description) {
+      fabricMap[code] = {
+        composition,
+        coo,
+        description,
+        category: currentCategory
+      };
+    }
+  }
+
+  log("INFO", `Parsed fabric workbook: ${Object.keys(fabricMap).length} fabric codes`);
+  return fabricMap;
+}
+
+/**
+ * Parse the jeans line sheet PDF via Claude Vision.
+ * Returns: Map<styleNumber, { styleName, styleDescription, category, frtRise, inseam, legOpen, ... }>
+ */
+async function parseLineSheetPdf(pdfPath) {
+  const pdfBuffer = fs.readFileSync(pdfPath);
+  const base64Pdf = pdfBuffer.toString("base64");
+
+  log("INFO", "Parsing line sheet PDF via Claude Vision...");
+
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 16000,
+    messages: [{
+      role: "user",
+      content: [
+        {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: base64Pdf }
+        },
+        {
+          type: "text",
+          text: `Extract ALL rows from this L'AGENCE denim style/description chart into a JSON array.
+
+The document is organized by garment category sections: PANTS, SHORTS, SKIRTS, JACKETS, OTHER.
+Each section has different measurement columns.
+
+Return ONLY a JSON array, starting with [ and ending with ]. Each element:
+{
+  "style_number": "2789",
+  "style_name": "ABILENE",
+  "style_description": "HIGH RISE SLEEK BABY BOOT SLIT",
+  "internal_reference": "BASED OF SELMA",
+  "category": "PANTS",
+  "measurements": {
+    "frt_rise": "9 3/4\\"",
+    "inseam": "34\\"",
+    "leg_open": "17 1/2\\""
+  }
+}
+
+For SKIRTS use: "cntr_frt", "cntr_bk", "sweep" in measurements.
+For JACKETS/OTHER use: "hps_lgth", "slv_lgth", "sweep" in measurements.
+
+CRITICAL: Extract EVERY row from EVERY page. Do not skip any styles.
+Your response must start with [ and end with ] - no other text.`
+        }
+      ]
+    }]
+  });
+
+  const text = response.content[0]?.text || "";
+  let styles = [];
+  try {
+    // Extract JSON array from response
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      styles = JSON.parse(jsonMatch[0]);
+    }
+  } catch (parseErr) {
+    log("ERROR", `Failed to parse line sheet JSON: ${parseErr.message}`);
+    log("DEBUG", `Raw response (first 500 chars): ${text.substring(0, 500)}`);
+  }
+
+  // Build lookup map by style number
+  const lineSheetMap = {};
+  for (const style of styles) {
+    const num = String(style.style_number || "").trim();
+    if (num) {
+      lineSheetMap[num] = style;
+    }
+  }
+
+  log("INFO", `Parsed line sheet: ${Object.keys(lineSheetMap).length} styles from ${styles.length} rows`);
+  return lineSheetMap;
+}
+
+/**
+ * Derive the RISE category from a front rise measurement string.
+ * Low = under 9", Mid = 9-10.5", High = 10.5-12", Ultra-High = over 12"
+ */
+function deriveRiseCategory(frtRise) {
+  if (!frtRise) return "";
+  // Parse measurement like '9 3/4"' or '10 1/2"' into decimal inches
+  const cleaned = frtRise.replace(/"/g, "").trim();
+  const parts = cleaned.split(/\s+/);
+  let inches = parseFloat(parts[0]) || 0;
+  if (parts[1] && parts[1].includes("/")) {
+    const [num, den] = parts[1].split("/");
+    inches += (parseFloat(num) || 0) / (parseFloat(den) || 1);
+  }
+  if (inches <= 0) return "";
+  if (inches < 9) return "Low";
+  if (inches < 10.5) return "Mid";
+  if (inches < 12) return "High";
+  return "Ultra-High";
+}
+
+/**
+ * Derive PANT FIT from style description.
+ */
+function derivePantFit(description) {
+  if (!description) return "";
+  const d = description.toUpperCase();
+  if (d.includes("SKINNY") || d.includes("SLIM") && !d.includes("FLARE")) return "Skinny";
+  if (d.includes("STRAIGHT") || d.includes("CIGARETTE") || d.includes("STOVEPIPE")) return "Straight";
+  if (d.includes("FLARE") || d.includes("BOOT")) return "Flare/Bootcut";
+  if (d.includes("WIDE") || d.includes("RELAXED") || d.includes("SLOUCH") || d.includes("PALAZZO") || d.includes("TROUSER")) return "Wide/Relaxed";
+  return "";
+}
+
+/**
+ * Derive STANDARD PRODUCT LENGTH from inseam + description.
+ */
+function deriveProductLength(inseam, description) {
+  const d = (description || "").toUpperCase();
+  if (d.includes("CROP") || d.includes("PEDAL") || d.includes("BERMUDA") || d.includes("SHORT")) return "Cropped";
+
+  // Parse inseam measurement
+  if (inseam) {
+    const cleaned = inseam.replace(/"/g, "").trim();
+    const parts = cleaned.split(/\s+/);
+    let inches = parseFloat(parts[0]) || 0;
+    if (parts[1] && parts[1].includes("/")) {
+      const [num, den] = parts[1].split("/");
+      inches += (parseFloat(num) || 0) / (parseFloat(den) || 1);
+    }
+    if (inches > 0 && inches <= 27) return "Cropped";
+    if (inches >= 34) return "Long";
+  }
+
+  return "Regular";
+}
+
+/**
+ * Build a synthetic extraction result from line sheet data,
+ * matching the format Claude returns for tech pack extractions.
+ */
+function buildLineSheetExtractionResult(lineSheetEntry) {
+  const m = lineSheetEntry.measurements || {};
+  const desc = lineSheetEntry.style_description || "";
+  const category = (lineSheetEntry.category || "").toUpperCase();
+
+  const frtRise = m.frt_rise || "";
+  const inseam = m.inseam || "";
+  const legOpen = m.leg_open || "";
+  const hpsLgth = m.hps_lgth || "";
+  const slvLgth = m.slv_lgth || "";
+
+  // For pants/shorts: HPS/RISE = frt_rise, SLEEVE/INSEAM = inseam
+  // For jackets/other: HPS/RISE = hps_lgth, SLEEVE/INSEAM = slv_lgth
+  const isBottom = ["PANTS", "SHORTS"].includes(category);
+  const isSkirt = category === "SKIRTS";
+  const isJacket = ["JACKETS", "OTHER"].includes(category);
+
+  const hpsRise = isBottom || isSkirt ? frtRise : (hpsLgth || frtRise);
+  const slvInseam = isBottom ? inseam : (slvLgth || inseam);
+
+  const riseCategory = isBottom ? deriveRiseCategory(frtRise) : "";
+  const pantFit = isBottom ? derivePantFit(desc) : "";
+  const productLength = isBottom ? deriveProductLength(inseam, desc) : "";
+
+  // Determine closures from description
+  let closures = "";
+  const dUpper = desc.toUpperCase();
+  if (dUpper.includes("PULL ON")) closures = "None";
+  else if (dUpper.includes("BUTTON FLY") || dUpper.includes("BUTTONS")) closures = "Buttons";
+  else if (dUpper.includes("LACE UP")) closures = "None";
+  else if (isBottom) closures = "Zip";
+
+  // Determine dress/skirt length
+  let dressSkirtLength = "";
+  if (isSkirt) {
+    if (dUpper.includes("MINI") || dUpper.includes("MICRO")) dressSkirtLength = "Mini";
+    else if (dUpper.includes("MIDI") || dUpper.includes("KNEE")) dressSkirtLength = "Midi";
+    else if (dUpper.includes("MAXI")) dressSkirtLength = "Maxi";
+  }
+
+  const src = "From jeans line sheet";
+
+  return {
+    "HPS / RISE": { value: hpsRise, logic: src, needs_review: false },
+    "SLEEVE LENGTH / INSEAM": { value: slvInseam, logic: src, needs_review: false },
+    "LINING CONTENT": { value: "", logic: "Not available in line sheet", needs_review: false },
+    "LEG OPENING": { value: legOpen, logic: src, needs_review: false },
+    "SHOULDER PADS": { value: isJacket ? "" : "No", logic: src, needs_review: isJacket },
+    "LINING": { value: "", logic: "Not available in line sheet", needs_review: false },
+    "POCKETS": { value: isBottom ? "Yes" : "", logic: src, needs_review: false },
+    "CLOSURES": { value: closures, logic: `Derived from description: ${desc}`, needs_review: !closures },
+    "STANDARD PRODUCT LENGTH": { value: productLength, logic: `Derived from inseam ${inseam} and description`, needs_review: false },
+    "RTW FIT": { value: isBottom ? "Regular" : "", logic: src, needs_review: true },
+    "SLEEVE LENGTH": { value: isJacket ? "" : "", logic: src, needs_review: false },
+    "RISE": { value: riseCategory, logic: `Derived from FRT RISE ${frtRise}`, needs_review: false },
+    "PANT FIT": { value: pantFit, logic: `Derived from description: ${desc}`, needs_review: false },
+    "DRESS/SKIRT LENGTH": { value: dressSkirtLength, logic: src, needs_review: false },
+    "OCCASION (DRESSES ONLY)": { value: "", logic: "Not a dress", needs_review: false }
+  };
+}
+
 async function uploadPdfToSupabase(filePath, styleNo) {
   const fileName = `Tech_Pack_${safe(styleNo)}.pdf`;
   const fileBuffer = fs.readFileSync(filePath);
@@ -661,8 +949,9 @@ async function extractAttributesFromPdf(pdfPath, styleNo, retryCount = 0) {
 // KEY BEHAVIORS:
 // 1. Always outputs ALL canonical fields from FIELD_DEFINITIONS (flexible input)
 // 2. Preserves any uploaded data - only fills in EMPTY cells
+// 3. Enriches with fabric workbook data (FABRIC COO, MATERIAL CATEGORY) when available
 // Returns both main data and logic/confidence data for a second tab
-function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
+function prepareExtractedData(extractionResults, styleToRows, originalHeader, fabricMap = {}) {
   // Build a map of styleNo prefix -> extracted data (full object with logic)
   const extractionMap = {};
   for (const result of extractionResults) {
@@ -670,6 +959,8 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
       extractionMap[result.styleNo] = result.data;
     }
   }
+
+  const hasFabricData = Object.keys(fabricMap).length > 0;
 
   const getValue = (field) => {
     if (!field) return "";
@@ -705,6 +996,7 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
   log("DEBUG", `Original CSV headers: ${originalHeader ? originalHeader.join(', ') : 'none'}`);
   log("DEBUG", `Canonical output headers (${headers.length}): ${headers.join(', ')}`);
   log("DEBUG", `Tech pack fields to fill: ${techPackFieldNames.join(', ')}`);
+  if (hasFabricData) log("DEBUG", `Fabric workbook loaded: ${Object.keys(fabricMap).length} fabric codes`);
 
   const rows = [];
   const logicRows = []; // For the logic tab
@@ -733,6 +1025,15 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
     for (const origRow of originalRows) {
       const row = {};
 
+      // Look up fabric data from workbook if available
+      let fabricInfo = null;
+      if (hasFabricData && origRow.itemId) {
+        const { fabricCode } = parseItemIdParts(origRow.itemId);
+        if (fabricCode && fabricMap[fabricCode]) {
+          fabricInfo = fabricMap[fabricCode];
+        }
+      }
+
       // Build row using ALL canonical fields
       for (const fieldName of allFieldNames) {
         // Look up input value by field name (case-insensitive via rowData map)
@@ -746,10 +1047,28 @@ function prepareExtractedData(extractionResults, styleToRows, originalHeader) {
           } else {
             row[fieldName] = getValue(extractedData[fieldName]); // Fill in missing
           }
+        } else if (fieldName === "FABRIC COO" && fabricInfo) {
+          // Fabric COO: use input if present, otherwise fill from workbook
+          row[fieldName] = (inputValue && inputValue.trim()) ? inputValue : (fabricInfo.coo || "");
+        } else if (fieldName === "MATERIAL CATEGORY" && fabricInfo) {
+          // Material category: use input if present, otherwise fill from workbook
+          row[fieldName] = (inputValue && inputValue.trim()) ? inputValue : (fabricInfo.category || "");
         } else {
           // input_csv or separate_csv field - always use input value (might be empty)
           row[fieldName] = inputValue;
         }
+      }
+
+      // Add fabric composition as a logic row for transparency
+      if (fabricInfo && fabricInfo.composition) {
+        const { fabricCode } = parseItemIdParts(origRow.itemId);
+        logicRows.push({
+          "STYLE PREFIX": styleNo,
+          "FIELD": "FABRIC COMPOSITION (from workbook)",
+          "VALUE": fabricInfo.composition,
+          "LOGIC": `Fabric code ${fabricCode} → ${fabricInfo.description || fabricInfo.composition}`,
+          "NEEDS REVIEW": "NO"
+        });
       }
 
       // Add PDF link
@@ -847,11 +1166,77 @@ async function main() {
 
     log("INFO", `Found ${totalStyles} styles`);
 
-    // ========== PHASE 1: DOWNLOAD PDFS ==========
+    // ========== PHASE 0: PARSE SUPPLEMENTARY DATA SOURCES ==========
+    const supplementaryFiles = job.supplementary_files || {};
+    let lineSheetMap = {};
+    let fabricMap = {};
+
+    // Parse line sheet PDF if provided
+    if (supplementaryFiles.line_sheet) {
+      try {
+        log("PHASE", "Parsing line sheet PDF...");
+        await updateJob({ current_style: "Parsing line sheet..." });
+        const lsPath = path.join(OUT_DIR, `linesheet_${JOB_ID}.pdf`);
+        const { data: lsData, error: lsError } = await supabase.storage.from("job-inputs").download(supplementaryFiles.line_sheet);
+        if (lsError) throw new Error(`Failed to download line sheet: ${lsError.message}`);
+        fs.writeFileSync(lsPath, Buffer.from(await lsData.arrayBuffer()));
+        lineSheetMap = await parseLineSheetPdf(lsPath);
+      } catch (lsErr) {
+        log("WARN", `Line sheet parsing failed (non-fatal): ${lsErr.message}`);
+      }
+    }
+
+    // Parse fabric workbook CSV if provided
+    if (supplementaryFiles.fabric_workbook) {
+      try {
+        log("PHASE", "Parsing fabric workbook...");
+        await updateJob({ current_style: "Parsing fabric workbook..." });
+        const fwPath = path.join(OUT_DIR, `fabric_${JOB_ID}.csv`);
+        const { data: fwData, error: fwError } = await supabase.storage.from("job-inputs").download(supplementaryFiles.fabric_workbook);
+        if (fwError) throw new Error(`Failed to download fabric workbook: ${fwError.message}`);
+        fs.writeFileSync(fwPath, Buffer.from(await fwData.arrayBuffer()));
+        fabricMap = parseFabricWorkbook(fwPath);
+      } catch (fwErr) {
+        log("WARN", `Fabric workbook parsing failed (non-fatal): ${fwErr.message}`);
+      }
+    }
+
+    // Determine which styles are in the line sheet (skip Gerber for these)
+    // We need to map the styleNo (which may include fabric code) to the numeric-only style number
+    const lineSheetStyleSet = new Set(Object.keys(lineSheetMap));
+    const lineSheetResults = []; // Synthetic extraction results for line sheet styles
+    const nonLineSheetStyles = []; // Styles that need Gerber tech pack download
+
+    for (const styleNo of uniqueStyles) {
+      // styleNo from CSV might be "2789NGX" — extract numeric part
+      const { styleNumber } = parseItemIdParts(styleNo + "-");
+      if (lineSheetStyleSet.has(styleNumber)) {
+        // This style is in the line sheet — build synthetic extraction result
+        const entry = lineSheetMap[styleNumber];
+        const extractionData = buildLineSheetExtractionResult(entry);
+        lineSheetResults.push({
+          styleNo,
+          success: true,
+          data: extractionData,
+          source: "line_sheet"
+        });
+        // Count as both download + extract completed for progress tracking
+        totalProcessed += 2;
+        log("INFO", `Style ${styleNo} (${styleNumber}: ${entry.style_name}) → sourced from line sheet`);
+      } else {
+        nonLineSheetStyles.push(styleNo);
+      }
+    }
+
+    if (lineSheetResults.length > 0) {
+      log("PHASE", `${lineSheetResults.length} styles sourced from line sheet, ${nonLineSheetStyles.length} need Gerber download`);
+    }
+
+    // ========== PHASE 1: DOWNLOAD PDFS (only for non-line-sheet styles) ==========
     log("PHASE", "Starting PDF downloads...");
 
-    // Filter out already-completed downloads for resume capability
-    const stylesToDownload = uniqueStyles.filter(s => !completedDownloads.has(s));
+    // Filter out already-completed downloads and line-sheet styles for resume capability
+    const stylesToDownload = nonLineSheetStyles.filter(s => !completedDownloads.has(s));
     const styleQueue = [...stylesToDownload];
     const downloadResults = [];
 
@@ -871,29 +1256,34 @@ async function main() {
       }
     }
 
-    if (stylesToDownload.length < uniqueStyles.length) {
-      log("RESUME", `Skipping ${uniqueStyles.length - stylesToDownload.length} already-downloaded styles`);
+    if (stylesToDownload.length < nonLineSheetStyles.length) {
+      log("RESUME", `Skipping ${nonLineSheetStyles.length - stylesToDownload.length} already-downloaded styles`);
     }
 
-    const browser = await chromium.launch({
-      headless: HEADLESS,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage',
-        '--no-sandbox'
-      ]
-    });
-    const workerCount = Math.min(PARALLEL_WORKERS, uniqueStyles.length);
-    const workerPromises = [];
-    for (let i = 1; i <= workerCount; i++) {
-      workerPromises.push(runDownloadWorker(i, browser, styleQueue, downloadResults, updateProgress));
+    // Only launch browser if there are styles that need Gerber download
+    if (styleQueue.length > 0) {
+      const browser = await chromium.launch({
+        headless: HEADLESS,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--disable-dev-shm-usage',
+          '--no-sandbox'
+        ]
+      });
+      const workerCount = Math.min(PARALLEL_WORKERS, styleQueue.length);
+      const workerPromises = [];
+      for (let i = 1; i <= workerCount; i++) {
+        workerPromises.push(runDownloadWorker(i, browser, styleQueue, downloadResults, updateProgress));
+      }
+      await Promise.all(workerPromises);
+      await browser.close();
+    } else {
+      log("INFO", "No styles need Gerber download — all sourced from line sheet or already downloaded");
     }
-    await Promise.all(workerPromises);
-    await browser.close();
 
     const successfulDownloads = downloadResults.filter(r => r.success);
     const failedDownloads = downloadResults.filter(r => !r.success);
-    log("PHASE", `Downloads complete: ${successfulDownloads.length}/${totalStyles} succeeded, ${failedDownloads.length} failed`);
+    log("PHASE", `Downloads complete: ${successfulDownloads.length}/${nonLineSheetStyles.length} Gerber styles succeeded, ${failedDownloads.length} failed`);
     if (failedDownloads.length > 0) {
       log("INFO", `Failed downloads: ${failedDownloads.map(r => r.styleNo).join(', ')}`);
     }
@@ -998,11 +1388,11 @@ async function main() {
     // ========== PHASE 3: SAVE EXTRACTED DATA ==========
     log("PHASE", "Saving extracted data to Supabase...");
 
-    // Combine new extraction results with previously-saved partial extractions
-    const allExtractionResults = [...extractionResults];
+    // Combine all extraction sources: line sheet + tech pack + resumed partial extractions
+    const allExtractionResults = [...lineSheetResults, ...extractionResults];
     for (const styleNo of Object.keys(partialExtractions)) {
-      // Only add if not already in extractionResults
-      if (!extractionResults.find(r => r.styleNo === styleNo)) {
+      // Only add if not already in extractionResults or lineSheetResults
+      if (!allExtractionResults.find(r => r.styleNo === styleNo)) {
         allExtractionResults.push({
           styleNo,
           success: true,
@@ -1010,9 +1400,9 @@ async function main() {
         });
       }
     }
-    log("DEBUG", `Total extraction results: ${allExtractionResults.length} (${extractionResults.length} new + ${Object.keys(partialExtractions).length} resumed)`);
+    log("DEBUG", `Total extraction results: ${allExtractionResults.length} (${lineSheetResults.length} line sheet + ${extractionResults.length} tech pack + ${Object.keys(partialExtractions).length} resumed)`);
 
-    const extractedData = prepareExtractedData(allExtractionResults, styleToRows, originalHeader);
+    const extractedData = prepareExtractedData(allExtractionResults, styleToRows, originalHeader, fabricMap);
     log("DEBUG", `Extracted data: ${extractedData.rows.length} rows, ${extractedData.headers.length} headers`);
     log("DEBUG", `Logic tab: ${extractedData.logicRows.length} logic rows, ${extractedData.logicHeaders.length} headers`);
     if (extractedData.logicRows.length > 0) {
@@ -1020,7 +1410,8 @@ async function main() {
     }
 
     // ========== COMPLETE ==========
-    const failedCount = totalStyles - successfulExtractions.length;
+    const totalSuccessful = successfulExtractions.length + lineSheetResults.length;
+    const failedCount = totalStyles - totalSuccessful;
     const failedStylesList = [
       ...failedDownloads.map(r => r.styleNo),
       ...failedExtractions.map(r => r.styleNo)
@@ -1029,7 +1420,7 @@ async function main() {
     await updateJob({
       status: "ready_for_export",
       progress_percent: 100,
-      successful_count: successfulExtractions.length,
+      successful_count: totalSuccessful,
       failed_count: failedCount,
       extracted_data: extractedData,
       error_message: failedCount > 0
@@ -1037,7 +1428,7 @@ async function main() {
         : null
     });
 
-    log("COMPLETE", `Job finished: ${successfulExtractions.length}/${totalStyles} styles extracted. ${failedCount > 0 ? `Failed: ${failedStylesList.join(', ')}` : 'All successful!'}`);
+    log("COMPLETE", `Job finished: ${totalSuccessful}/${totalStyles} styles extracted (${lineSheetResults.length} from line sheet, ${successfulExtractions.length} from tech packs). ${failedCount > 0 ? `Failed: ${failedStylesList.join(', ')}` : 'All successful!'}`);
     stopHeartbeat();
 
   } catch (error) {

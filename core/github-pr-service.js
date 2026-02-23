@@ -40,15 +40,24 @@ ${JSON.stringify(capabilities.map(c => ({
   change_types: c.change_types
 })), null, 2)}
 
+Classification rules:
+- "question": General questions, greetings, or asking about how things work
+- "data_feedback": User is discussing results of a specific job, reporting issues with extracted data, wanting to correct field values, or giving feedback on extraction quality. Keywords: "issues with", "wrong", "incorrect", "last job", "results", "extracted", "fix", "correct", "notes on"
+- "extraction_rule": User is setting a persistent rule for how a field should always be extracted (e.g. "always set X to Y", "never mark Z as needs_review")
+- "capability_tweak": User wants to change how the system itself works (not correcting data, but changing behavior/features)
+- "new_capability": User wants an entirely new feature added
+
+IMPORTANT: If the user is talking about a specific job's results or data quality, that is "data_feedback", NOT "capability_tweak".
+
 Respond with JSON only (no markdown, no explanation):
 {
-  "request_type": "question" | "capability_tweak" | "new_capability",
+  "request_type": "question" | "data_feedback" | "extraction_rule" | "capability_tweak" | "new_capability",
   "matched_capability_id": "string or null",
   "complexity": "low" | "medium" | "high",
-  "change_description": "brief description of what needs to change",
+  "change_description": "brief description",
   "affected_files": ["array of likely file paths"],
-  "can_auto_pr": true/false (true for low/medium complexity tweaks, false otherwise),
-  "requires_plan_approval": true/false (true for new capabilities or high complexity)
+  "can_auto_pr": true/false,
+  "requires_plan_approval": true/false
 }`;
 
   try {

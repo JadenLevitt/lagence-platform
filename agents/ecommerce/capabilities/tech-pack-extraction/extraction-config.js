@@ -3,6 +3,13 @@
  *
  * IMPORTANT: Field names must EXACTLY match the column headers in the input CSV!
  * The input CSV already has all these columns - we fill them in, not add new ones.
+ *
+ * DATA SOURCES (in priority order):
+ *   1. input_csv     - Pass-through from Full Circle CSV upload
+ *   2. separate_csv  - From separate CSV; enriched by fabric workbook (FABRIC COO, MATERIAL CATEGORY)
+ *   3. tech_pack     - Extracted by Claude from Gerber tech pack PDFs
+ *   4. line_sheet    - Jeans/denim styles: measurements from line sheet PDF (skips Gerber entirely)
+ *   5. fabric_workbook - Fabric code lookup for composition, COO, material category
  */
 
 // Column names exactly as they appear in the input CSV
@@ -29,11 +36,11 @@ const FIELD_DEFINITIONS = [
     extraction_logic: "Pulled directly from Full Circle - already in input CSV"
   },
 
-  // ========== FROM SEPARATE CSV (keep existing value, don't extract) ==========
+  // ========== FROM SEPARATE CSV / FABRIC WORKBOOK (keep existing, enrich from workbook) ==========
   {
     field_name: "MATERIAL CATEGORY",
     source: "separate_csv",
-    extraction_logic: "Information from separate CSV, not Gerber - keep existing value"
+    extraction_logic: "From input CSV if present; otherwise derived from fabric workbook section (e.g. DENIM, SUITING, SILK)"
   },
   {
     field_name: "FILLING (OUTERWEAR)",
@@ -43,7 +50,7 @@ const FIELD_DEFINITIONS = [
   {
     field_name: "FABRIC COO",
     source: "separate_csv",
-    extraction_logic: "Information from separate CSV - keep existing value"
+    extraction_logic: "From input CSV if present; otherwise from fabric workbook COO lookup by fabric code in ITEM ID"
   },
   {
     field_name: "CARE INSTRUCTIONS",

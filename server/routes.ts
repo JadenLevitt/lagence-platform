@@ -302,11 +302,54 @@ export async function registerRoutes(
         });
       }
 
+      // For data feedback / extraction rules, load recent job context
+      let jobContext = "";
+      if (
+        classification.request_type === "data_feedback" ||
+        classification.request_type === "extraction_rule"
+      ) {
+        // Load the most recent completed jobs with extracted data
+        const { data: recentJobs } = await supabase
+          .from("jobs")
+          .select("id, file_name, status, extracted_data, created_at")
+          .eq("status", "completed")
+          .order("created_at", { ascending: false })
+          .limit(3);
+
+        if (recentJobs && recentJobs.length > 0) {
+          jobContext = "\n\n=== RECENT JOBS (for context) ===\n";
+          for (const job of recentJobs) {
+            jobContext += `\nJob: "${job.file_name}" (${job.status}, ${new Date(job.created_at).toLocaleDateString()})\n`;
+            if (job.extracted_data?.headers && job.extracted_data?.rows) {
+              const headers = job.extracted_data.headers as string[];
+              const rows = job.extracted_data.rows as any[][];
+              // Show first few styles with their field values
+              const stylesToShow = Math.min(rows.length, 3);
+              for (let i = 0; i < stylesToShow; i++) {
+                const row = rows[i];
+                jobContext += `  Style ${i + 1}:\n`;
+                for (let j = 0; j < headers.length; j++) {
+                  const val = row[j];
+                  if (val && val !== "" && val !== "N/A") {
+                    const display = typeof val === "object" ? JSON.stringify(val) : String(val);
+                    jobContext += `    ${headers[j]}: ${display}\n`;
+                  }
+                }
+              }
+              if (rows.length > stylesToShow) {
+                jobContext += `  ... and ${rows.length - stylesToShow} more styles\n`;
+              }
+            }
+          }
+          jobContext += `\nWhen the user points out issues with specific fields, help them correct values. If they describe a pattern that should apply to future extractions, output a set_extraction_rule JSON action.\n`;
+        }
+      }
+
       // For regular questions, get response from Claude
       const response = await anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
         max_tokens: 2048,
-        system: systemPrompt,
+        system: systemPrompt + jobContext,
         messages: body.messages,
       });
 
@@ -370,21 +413,56 @@ export async function registerRoutes(
   });
 
   // ─── Start Job (file upload + spawn processor) ───
-  app.post("/api/start-job", upload.single("file"), async (req, res) => {
+  // Accepts: "file" (required CSV), plus optional supplementary files.
+  // Supplementary files can be sent as named fields (lineSheet, fabricWorkbook)
+  // OR as generic "supplementary" files — the backend auto-detects type by extension:
+  //   PDF → line_sheet,  CSV → fabric_workbook
+  app.post("/api/start-job", upload.fields([
+    { name: "file", maxCount: 1 },
+    { name: "lineSheet", maxCount: 1 },
+    { name: "fabricWorkbook", maxCount: 1 },
+    { name: "supplementary", maxCount: 5 },
+  ]), async (req, res) => {
     const timestamp = new Date().toISOString();
     console.log(`\n${"=".repeat(60)}`);
     console.log(`[${timestamp}] START-JOB REQUEST RECEIVED`);
     console.log(`${"=".repeat(60)}`);
 
     try {
-      const file = req.file;
+      const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+      const file = files?.file?.[0];
       const rowCount = parseInt(req.body.rowCount || "0", 10);
 
-      console.log(`[STEP 1] File received:`, {
+      // Resolve supplementary files: explicit names take priority, then auto-detect
+      let lineSheetFile = files?.lineSheet?.[0];
+      let fabricWorkbookFile = files?.fabricWorkbook?.[0];
+
+      // Auto-classify any generic "supplementary" uploads by file type
+      const genericFiles = files?.supplementary || [];
+      for (const gf of genericFiles) {
+        const ext = (gf.originalname || "").toLowerCase().split(".").pop();
+        const isPdf = ext === "pdf" || gf.mimetype === "application/pdf";
+        const isCsv = ext === "csv" || gf.mimetype === "text/csv";
+
+        if (isPdf && !lineSheetFile) {
+          lineSheetFile = gf;
+          console.log(`[AUTO-DETECT] Classified "${gf.originalname}" as line sheet (PDF)`);
+        } else if (isCsv && !fabricWorkbookFile) {
+          fabricWorkbookFile = gf;
+          console.log(`[AUTO-DETECT] Classified "${gf.originalname}" as fabric workbook (CSV)`);
+        } else {
+          console.log(`[AUTO-DETECT] Skipping "${gf.originalname}" — type already assigned or unrecognized`);
+        }
+      }
+
+      console.log(`[STEP 1] Files received:`, {
         hasFile: !!file,
         fileName: file?.originalname,
         fileSize: file?.size,
-        mimeType: file?.mimetype,
+        hasLineSheet: !!lineSheetFile,
+        lineSheetName: lineSheetFile?.originalname,
+        hasFabricWorkbook: !!fabricWorkbookFile,
+        fabricWorkbookName: fabricWorkbookFile?.originalname,
         rowCount,
       });
 
@@ -397,7 +475,7 @@ export async function registerRoutes(
       const filePath = `${Date.now()}_${fileName}`;
       console.log(`[STEP 2] Generated file path: ${filePath}`);
 
-      // Upload file to Supabase Storage
+      // Upload main CSV to Supabase Storage
       console.log(
         `[STEP 3] Uploading to Supabase Storage bucket "job-inputs"...`
       );
@@ -423,6 +501,41 @@ export async function registerRoutes(
         `[STEP 3] Upload complete in ${Date.now() - uploadStart}ms`
       );
 
+      // Upload supplementary files (line sheet + fabric workbook)
+      const supplementaryFiles: Record<string, string> = {};
+
+      if (lineSheetFile) {
+        const lsPath = `${Date.now()}_linesheet_${lineSheetFile.originalname}`;
+        const { error: lsError } = await supabase.storage
+          .from("job-inputs")
+          .upload(lsPath, lineSheetFile.buffer, {
+            contentType: lineSheetFile.mimetype,
+            upsert: false,
+          });
+        if (lsError) {
+          console.error(`[WARN] Line sheet upload failed:`, lsError.message);
+        } else {
+          supplementaryFiles.line_sheet = lsPath;
+          console.log(`[STEP 3b] Line sheet uploaded: ${lsPath}`);
+        }
+      }
+
+      if (fabricWorkbookFile) {
+        const fwPath = `${Date.now()}_fabric_${fabricWorkbookFile.originalname}`;
+        const { error: fwError } = await supabase.storage
+          .from("job-inputs")
+          .upload(fwPath, fabricWorkbookFile.buffer, {
+            contentType: fabricWorkbookFile.mimetype,
+            upsert: false,
+          });
+        if (fwError) {
+          console.error(`[WARN] Fabric workbook upload failed:`, fwError.message);
+        } else {
+          supplementaryFiles.fabric_workbook = fwPath;
+          console.log(`[STEP 3c] Fabric workbook uploaded: ${fwPath}`);
+        }
+      }
+
       // Create job record
       const jobId = randomUUID();
       console.log(`[STEP 4] Generated job ID: ${jobId}`);
@@ -431,13 +544,17 @@ export async function registerRoutes(
         `[STEP 5] Creating job record in Supabase "jobs" table...`
       );
       const insertStart = Date.now();
-      const { error: insertError } = await supabase.from("jobs").insert({
+      const jobRecord: Record<string, any> = {
         id: jobId,
         status: "pending",
         progress_percent: 0,
         input_file_name: filePath,
         submitted_by: "web-user",
-      });
+      };
+      if (Object.keys(supplementaryFiles).length > 0) {
+        jobRecord.supplementary_files = supplementaryFiles;
+      }
+      const { error: insertError } = await supabase.from("jobs").insert(jobRecord);
 
       if (insertError) {
         console.error(`[ERROR] Supabase insert failed:`, insertError);
@@ -480,6 +597,7 @@ export async function registerRoutes(
         jobId,
         vmTriggered: true,
         message: "Job queued successfully",
+        supplementaryFiles: Object.keys(supplementaryFiles),
       });
     } catch (error: any) {
       console.error(`[FATAL ERROR] Start job failed:`, {
@@ -489,6 +607,102 @@ export async function registerRoutes(
       return res
         .status(500)
         .json({ error: "Internal server error", details: error.message });
+    }
+  });
+
+  // ─── Add Supplementary Files to Existing Job ───
+  // Accepts any files; auto-classifies PDF → line_sheet, CSV → fabric_workbook.
+  // Merges into existing supplementary_files, resets status to pending, re-spawns processor.
+  app.post("/api/jobs/:id/supplementary", upload.fields([
+    { name: "supplementary", maxCount: 5 },
+  ]), async (req, res) => {
+    try {
+      const { id: jobId } = req.params;
+
+      const idValidation = uuidSchema.safeParse(jobId);
+      if (!idValidation.success) {
+        return res.status(400).json({ error: "Invalid job ID" });
+      }
+
+      const { data: jobData, error: jobError } = await supabase
+        .from("jobs")
+        .select("supplementary_files, status")
+        .eq("id", jobId)
+        .maybeSingle();
+
+      if (jobError || !jobData) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+      const incoming = files?.supplementary || [];
+
+      if (incoming.length === 0) {
+        return res.status(400).json({ error: "No files uploaded" });
+      }
+
+      // Merge new files into existing supplementary_files
+      const supplementaryFiles: Record<string, string> = { ...(jobData.supplementary_files || {}) };
+
+      for (const gf of incoming) {
+        const ext = (gf.originalname || "").toLowerCase().split(".").pop();
+        const isPdf = ext === "pdf" || gf.mimetype === "application/pdf";
+        const isCsv = ext === "csv" || gf.mimetype === "text/csv";
+
+        if (isPdf) {
+          const lsPath = `${Date.now()}_linesheet_${gf.originalname}`;
+          const { error } = await supabase.storage
+            .from("job-inputs")
+            .upload(lsPath, gf.buffer, { contentType: gf.mimetype, upsert: false });
+          if (!error) {
+            supplementaryFiles.line_sheet = lsPath;
+            console.log(`[SUPPLEMENTARY] Classified "${gf.originalname}" as line sheet`);
+          }
+        } else if (isCsv) {
+          const fwPath = `${Date.now()}_fabric_${gf.originalname}`;
+          const { error } = await supabase.storage
+            .from("job-inputs")
+            .upload(fwPath, gf.buffer, { contentType: gf.mimetype, upsert: false });
+          if (!error) {
+            supplementaryFiles.fabric_workbook = fwPath;
+            console.log(`[SUPPLEMENTARY] Classified "${gf.originalname}" as fabric workbook`);
+          }
+        } else {
+          console.log(`[SUPPLEMENTARY] Skipping "${gf.originalname}" — unrecognized type`);
+        }
+      }
+
+      // Reset job for reprocessing
+      await supabase.from("jobs").update({
+        supplementary_files: supplementaryFiles,
+        status: "pending",
+        progress_percent: 0,
+        current_style: null,
+        error_message: null,
+      }).eq("id", jobId);
+
+      // Re-spawn job processor
+      const jobProcessorPath = path.resolve(
+        REPO_ROOT,
+        "agents",
+        "ecommerce",
+        "capabilities",
+        "tech-pack-extraction",
+        "job-processor.js"
+      );
+
+      const jobProcessor = spawn("node", [jobProcessorPath, jobId], {
+        detached: true,
+        stdio: "ignore" as const,
+        env: { ...process.env },
+      });
+      (jobProcessor as any).unref();
+
+      console.log(`[SUPPLEMENTARY] Job ${jobId} reset and processor re-spawned`);
+      return res.json({ success: true, jobId });
+    } catch (error: any) {
+      console.error("[SUPPLEMENTARY] Error:", error.message);
+      return res.status(500).json({ error: "Internal server error", details: error.message });
     }
   });
 
@@ -640,7 +854,7 @@ export async function registerRoutes(
   // ─── Create Google Sheet ───
   app.post("/api/create-google-sheet", async (req, res) => {
     try {
-      const { accessToken, jobId } = req.body;
+      const { accessToken, jobId, existingSpreadsheetId } = req.body;
 
       if (!accessToken || !jobId) {
         return res.status(400).json({ error: "Missing required fields" });
@@ -648,6 +862,9 @@ export async function registerRoutes(
 
       console.log("[Create Sheet] === Starting Google Sheet export ===");
       console.log("[Create Sheet] Job ID:", jobId);
+      if (existingSpreadsheetId) {
+        console.log("[Create Sheet] Updating existing spreadsheet:", existingSpreadsheetId);
+      }
 
       const { data: jobData, error: jobError } = await supabase
         .from("jobs")
@@ -670,57 +887,73 @@ export async function registerRoutes(
         logicRows?: string[][];
       } | null;
 
-      // Create the spreadsheet
-      const fileName = jobData?.input_file_name || "Export";
-      const title = `L'AGENCE Catsy - ${fileName} - ${new Date().toISOString().slice(0, 10)}`;
+      let spreadsheetId: string;
+      let sheetUrl: string;
 
-      const createResponse = await fetch(
-        "https://sheets.googleapis.com/v4/spreadsheets",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            properties: { title },
-            sheets: [{ properties: { title: "Data" } }],
-          }),
-        }
-      );
+      if (existingSpreadsheetId) {
+        // ── Update existing spreadsheet ──
+        spreadsheetId = existingSpreadsheetId;
+        sheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
 
-      if (!createResponse.ok) {
-        const err = await createResponse.json();
-        console.error("[Create Sheet] Google Sheets create error:", err);
-        return res.status(500).json({
-          error: err.error?.message || "Failed to create spreadsheet",
-        });
-      }
-
-      const sheet = await createResponse.json();
-      const spreadsheetId = sheet.spreadsheetId;
-      const sheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
-      console.log("[Create Sheet] Spreadsheet created:", spreadsheetId);
-
-      // Set public permissions
-      const permResponse = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${spreadsheetId}/permissions`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ role: "reader", type: "anyone" }),
-        }
-      );
-
-      if (!permResponse.ok) {
-        const err = await permResponse.json();
-        console.error(
-          "[Create Sheet] Failed to set public permissions:",
-          err
+        // Clear the Data sheet first
+        await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Data!A1:ZZ100000:clear`,
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${accessToken}` },
+          }
         );
+        console.log("[Create Sheet] Cleared existing Data sheet");
+      } else {
+        // ── Create a new spreadsheet ──
+        const fileName = jobData?.input_file_name || "Export";
+        const title = `L'AGENCE Catsy - ${fileName} - ${new Date().toISOString().slice(0, 10)}`;
+
+        const createResponse = await fetch(
+          "https://sheets.googleapis.com/v4/spreadsheets",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              properties: { title },
+              sheets: [{ properties: { title: "Data" } }],
+            }),
+          }
+        );
+
+        if (!createResponse.ok) {
+          const err = await createResponse.json();
+          console.error("[Create Sheet] Google Sheets create error:", err);
+          return res.status(500).json({
+            error: err.error?.message || "Failed to create spreadsheet",
+          });
+        }
+
+        const sheet = await createResponse.json();
+        spreadsheetId = sheet.spreadsheetId;
+        sheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+        console.log("[Create Sheet] Spreadsheet created:", spreadsheetId);
+
+        // Set public permissions on new sheet
+        const permResponse = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${spreadsheetId}/permissions`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ role: "reader", type: "anyone" }),
+          }
+        );
+
+        if (!permResponse.ok) {
+          const err = await permResponse.json();
+          console.error("[Create Sheet] Failed to set public permissions:", err);
+        }
       }
 
       // Write data to the Data sheet
@@ -752,64 +985,65 @@ export async function registerRoutes(
 
         if (!updateResponse.ok) {
           const err = await updateResponse.json();
-          console.error(
-            "[Create Sheet] Google Sheets update error:",
-            err
-          );
+          console.error("[Create Sheet] Google Sheets update error:", err);
         }
       }
 
-      // Create Extraction Logic tab if logic data exists
+      // Create/update Extraction Logic tab if logic data exists
       if (extractedData?.logicHeaders && extractedData?.logicRows) {
-        console.log("[Create Sheet] Creating Extraction Logic tab...");
+        console.log("[Create Sheet] Writing Extraction Logic tab...");
 
-        const addSheetResponse = await fetch(
-          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              requests: [
-                {
-                  addSheet: {
-                    properties: { title: "Extraction Logic" },
-                  },
-                },
-              ],
-            }),
-          }
-        );
-
-        if (addSheetResponse.ok) {
-          const logicData: string[][] = [
-            extractedData.logicHeaders,
-            ...extractedData.logicRows,
-          ];
-
+        if (existingSpreadsheetId) {
+          // Clear existing logic tab
           await fetch(
-            `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Extraction%20Logic!A1?valueInputOption=RAW`,
+            `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Extraction%20Logic!A1:ZZ100000:clear`,
             {
-              method: "PUT",
+              method: "POST",
+              headers: { Authorization: `Bearer ${accessToken}` },
+            }
+          );
+        } else {
+          // Add the tab on a new spreadsheet
+          await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+            {
+              method: "POST",
               headers: {
                 Authorization: `Bearer ${accessToken}`,
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({ values: logicData }),
+              body: JSON.stringify({
+                requests: [{ addSheet: { properties: { title: "Extraction Logic" } } }],
+              }),
             }
           );
         }
+
+        const logicData: string[][] = [
+          extractedData.logicHeaders,
+          ...extractedData.logicRows,
+        ];
+
+        await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Extraction%20Logic!A1?valueInputOption=RAW`,
+          {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ values: logicData }),
+          }
+        );
       }
 
-      // Update job record with sheet URL
+      // Update job record with sheet URL (no-op if URL unchanged)
       await supabase
         .from("jobs")
         .update({ status: "completed", output_sheet_url: sheetUrl })
         .eq("id", jobId);
 
-      console.log("[Create Sheet] Job updated, returning sheetUrl");
+      console.log("[Create Sheet] Done, returning sheetUrl");
       return res.json({ sheetUrl });
     } catch (error) {
       console.error("[Create Sheet] Error:", error);
@@ -1211,6 +1445,77 @@ export async function registerRoutes(
         .eq("id", id);
 
       return res.json({ merged, provenance });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Get data sources for a job
+  app.get("/api/jobs/:id/sources", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validId = uuidSchema.safeParse(id);
+      if (!validId.success) {
+        return res.status(400).json({ error: "Invalid job ID" });
+      }
+
+      // Get job record for the CSV source
+      const { data: job, error: jobErr } = await supabase
+        .from("jobs")
+        .select("input_file_name, status, extracted_data")
+        .eq("id", id)
+        .single();
+
+      if (jobErr || !job) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+
+      const sources: any[] = [];
+
+      // Add the original CSV as a source
+      if (job.input_file_name) {
+        sources.push({
+          type: "input_csv",
+          name: job.input_file_name,
+          status: "complete",
+          merged: true,
+        });
+      }
+
+      // Add tech pack extraction status
+      const hasTechPackData = job.extracted_data?.rows?.some(
+        (row: any) => row["PDF_LINK"] && row["PDF_LINK"] !== ""
+      );
+      if (hasTechPackData) {
+        sources.push({
+          type: "tech_pack",
+          name: "Gerber Tech Packs",
+          status: job.status === "ready_for_export" || job.status === "completed" ? "complete" : "processing",
+          merged: true,
+        });
+      }
+
+      // Get uploaded documents linked to this job
+      const { data: docs } = await supabase
+        .from("uploaded_documents")
+        .select("id, file_name, document_type, status, job_id")
+        .eq("job_id", id)
+        .order("created_at", { ascending: true });
+
+      if (docs) {
+        for (const doc of docs) {
+          sources.push({
+            type: "uploaded_pdf",
+            name: doc.file_name,
+            document_type: doc.document_type,
+            document_id: doc.id,
+            status: doc.status,
+            merged: doc.status === "extracted",
+          });
+        }
+      }
+
+      return res.json({ sources });
     } catch (e: any) {
       return res.status(500).json({ error: e.message });
     }

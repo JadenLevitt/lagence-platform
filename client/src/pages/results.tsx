@@ -263,7 +263,7 @@ export default function Results() {
           </div>
         </div>
         </div>
-        <ChatWidget agentName="emma" agentTitle="Emma" />
+        <ChatWidget agentName="ecommerce" agentTitle="Emma" />
       </div>
     </Layout>
   );
