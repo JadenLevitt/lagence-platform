@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { MessageCircle, Send, ThumbsUp, ThumbsDown, Paperclip, FileText, Loader2, Pencil, Check, X, ChevronDown, Mic, MicOff } from "lucide-react";
+import { MessageCircle, Send, ThumbsUp, ThumbsDown, Paperclip, FileText, Loader2, Pencil, Check, X, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
@@ -67,12 +67,10 @@ export default function ChatWidget({
   const [correctedFields, setCorrectedFields] = useState<Set<string>>(new Set());
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [availableJobs, setAvailableJobs] = useState<JobOption[]>([]);
-  const [isListening, setIsListening] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedJobRef = useRef<string | null>(null);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
 
   // Keep ref in sync with state
   useEffect(() => {
@@ -87,67 +85,12 @@ export default function ChatWidget({
     scrollToBottom();
   }, [messages]);
 
-  // Cleanup polling and speech recognition on unmount
+  // Cleanup polling on unmount
   useEffect(() => {
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
-      if (recognitionRef.current) {
-        recognitionRef.current.abort();
-        recognitionRef.current = null;
-      }
     };
   }, []);
-
-  const toggleVoiceInput = () => {
-    if (isListening && recognitionRef.current) {
-      recognitionRef.current.stop();
-      return;
-    }
-
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      toast.error("Voice input is not supported in this browser");
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-
-    let finalTranscript = "";
-
-    recognition.onstart = () => setIsListening(true);
-
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript;
-        } else {
-          interim += transcript;
-        }
-      }
-      setInput(finalTranscript + interim);
-    };
-
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      if (event.error !== "aborted") {
-        toast.error(`Voice input error: ${event.error}`);
-      }
-      setIsListening(false);
-      recognitionRef.current = null;
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-      recognitionRef.current = null;
-    };
-
-    recognitionRef.current = recognition;
-    recognition.start();
-  };
 
   // Fetch available jobs when file is pending
   useEffect(() => {
@@ -754,18 +697,6 @@ export default function ChatWidget({
             disabled={isLoading}
           >
             <Paperclip className="w-4 h-4" />
-          </button>
-          <button
-            onClick={toggleVoiceInput}
-            className={`p-2 transition-colors ${
-              isListening
-                ? "text-red-500 hover:text-red-600 animate-pulse"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-            title={isListening ? "Stop listening" : "Voice input"}
-            disabled={isLoading}
-          >
-            {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
           </button>
           <input
             type="text"
